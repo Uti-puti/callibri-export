@@ -1,0 +1,9 @@
+[
+  {
+    "site_id": 12345,
+    "folder": "my-project",
+    "channels": ["Контекст"],
+    "split_by_channel": false,
+    "enabled": true
+  }
+]

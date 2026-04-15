@@ -1,0 +1,8 @@
+.env
+projects.json
+venv/
+output/
+__pycache__/
+build/
+dist/
+*.spec
