@@ -65,8 +65,8 @@ pyinstaller --onefile --windowed --name CallibriExport app.py
 
 ```json
 {
-  "site_id": 4112,
-  "folder": "energocenter",
+  "site_id": 4332,
+  "folder": "energ",
   "channels": ["Канал 1", "Канал 2"],
   "split_by_channel": true,
   "enabled": true
