@@ -66,8 +66,8 @@
 
 ```json
 {
-  "site_id": 93946,
-  "folder": "sparkcell",
+  "site_id": 93789,
+  "folder": "spit",
   "channels": ["Контекст"],
   "fields": ["date", "name_channel", "name", "phone", "comment", "status", "type", "source", "utm_campaign", "landing_page"],
   "enabled": true
