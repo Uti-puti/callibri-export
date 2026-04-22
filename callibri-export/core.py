@@ -1,7 +1,9 @@
 """
-core.py — бизнес-логика экспорта обращений из Callibri.
-Чистый модуль без CLI, без sys.exit. Все ошибки — через исключения.
-Используется и CLI-обёрткой (export.py), и GUI (app.py).
+core.py — провайдер-агностик: период, конфиг, запись файлов, оркестрация.
+
+Вся специфика API (Callibri, Calltouch) — в пакете providers/.
+run_export определяет провайдера для каждого проекта по ключу "provider"
+и делегирует выгрузку.
 """
 
 import csv
@@ -9,34 +11,21 @@ import os
 import re
 import sys
 import json
-import time
 import logging
 from datetime import datetime, timedelta
 
-import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
+import providers
+
 log = logging.getLogger(__name__)
-
-BASE_URL = "https://api.callibri.ru"
-
-# Типы обращений
-APPEAL_TYPES = ["calls", "feedbacks", "chats", "emails"]
-
-# Колонки по умолчанию
-DEFAULT_COLUMNS = [
-    "date", "name_channel", "comment", "status", "type",
-    "conversations_number", "utm_campaign",
-]
-
-MAX_RETRIES = 3  # максимум попыток на один чанк
 
 
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
 def get_app_dir():
-    """Директория приложения (рядом с .exe или рядом с .py)"""
+    """Директория приложения (рядом с .exe или рядом с .py)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -72,56 +61,15 @@ def resolve_period(date1_str=None, date2_str=None, days=None):
     return date1, date2
 
 
-def split_period(date1, date2):
-    """Разбиваем период на чанки по 7 дней включительно."""
-    chunks = []
-    current = date1
-    while current <= date2:
-        chunk_end = min(current + timedelta(days=6), date2)
-        chunks.append((current, chunk_end))
-        current = chunk_end + timedelta(days=1)
-    return chunks
-
-
-def format_date(iso_date_str):
-    """Конвертируем ISO дату в читаемый формат dd.mm.yyyy HH:MM"""
-    if not iso_date_str:
-        return ""
-    try:
-        dt = datetime.strptime(iso_date_str[:19], "%Y-%m-%dT%H:%M:%S")
-        return dt.strftime("%d.%m.%Y %H:%M")
-    except (ValueError, TypeError):
-        return str(iso_date_str)
-
-
-def extract_appeal_id(appeal):
-    """appeal_id из записи, или clbvid как запасной вариант (для дедупликации)."""
-    aid = appeal.get("appeal_id")
-    if aid:
-        return str(aid)
-    clbvid = appeal.get("clbvid")
-    return str(clbvid) if clbvid else ""
-
-
 def sanitize_filename(name):
-    """Убираем из имени канала символы, недопустимые в именах файлов."""
+    """Убираем из имени символы, недопустимые в именах файлов."""
     return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
 
 
-# ── Конфигурация ─────────────────────────────────────────────────────────────
-
-def check_credentials(email, token):
-    """Проверяем учётные данные. Возвращает (ok, message)."""
-    if not email or not token:
-        return False, "Заполни email и token"
-    if "example" in email:
-        return False, "Замени example-email на реальный"
-    return True, "OK"
-
+# ── Конфигурация проектов ────────────────────────────────────────────────────
 
 def load_projects(path=None):
-    """Загружаем список проектов из projects.json.
-    Бросает FileNotFoundError / ValueError при проблемах."""
+    """Загружаем projects.json. Бросает FileNotFoundError / ValueError."""
     if path is None:
         path = os.path.join(get_app_dir(), "projects.json")
     if not os.path.exists(path):
@@ -130,294 +78,54 @@ def load_projects(path=None):
             'Создай его рядом с приложением. Пример: [{"site_id": 4112, "folder": "energocenter"}]'
         )
     with open(path, encoding="utf-8") as f:
-        projects = json.load(f)
-    if not projects:
+        projects_data = json.load(f)
+    if not projects_data:
         raise ValueError("projects.json пустой — добавь хотя бы один проект.")
-    return projects
+    return projects_data
 
 
-def save_projects(projects, path=None):
-    """Сохраняем список проектов в projects.json."""
+def save_projects(projects_data, path=None):
+    """Сохраняем projects.json."""
     if path is None:
         path = os.path.join(get_app_dir(), "projects.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(projects, f, ensure_ascii=False, indent=2)
+        json.dump(projects_data, f, ensure_ascii=False, indent=2)
 
 
-# Все известные поля: имя → описание
-FIELD_DESCRIPTIONS = {
-    # Специальные (вычисляемые)
-    "date": "Дата обращения (dd.mm.yyyy HH:MM)",
-    "name_channel": "Название канала",
-    "type": "Тип обращения (calls/feedbacks/chats/emails)",
-    # API-поля
-    "appeal_id": "ID обращения (уникальный)",
-    "phone": "Телефон клиента",
-    "email": "E-mail клиента",
-    "name": "Имя клиента",
-    "comment": "Комментарий к обращению",
-    "content": "Полный текст обращения (заявки/email)",
-    "status": "Статус обращения (Лид, Нет ответа...)",
-    "source": "Источник трафика (Google, Yandex...)",
-    "traffic_type": "Тип трафика",
-    "region": "Регион клиента",
-    "device": "Устройство (desktop/mobile/tablet)",
-    "conversations_number": "Номер обращения клиента (1 = первое)",
-    "is_lid": "Является ли лидом (True/False)",
-    "name_type": "Тип обращения (Звонок, Заявка, E-mail)",
-    "landing_page": "Страница входа",
-    "lid_landing": "Целевая страница лида",
-    "site_referrer": "Реферер",
-    "link_download": "Ссылка на запись звонка",
-    "duration": "Длительность звонка, сек (только звонки)",
-    "billsec": "Длительность разговора, сек (только звонки)",
-    "responsible_manager": "Ответственный менеджер",
-    "responsible_manager_email": "Email менеджера",
-    "call_status": "Статус звонка",
-    "accurately": "Точное определение источника (True/False)",
-    "form_name": "Название формы (только заявки)",
-    "utm_source": "UTM source",
-    "utm_medium": "UTM medium",
-    "utm_campaign": "UTM campaign",
-    "utm_content": "UTM content",
-    "utm_term": "UTM term",
-    "query": "Поисковый запрос",
-    "channel_id": "ID канала",
-    "crm_client_id": "ID клиента в CRM",
-    "ym_uid": "Яндекс.Метрика UID",
-    "metrika_client_id": "Яндекс.Метрика Client ID",
-    "ua_client_id": "Google Analytics Client ID",
-    "clbvid": "Внутренний ID Callibri",
-}
-
-# Список всех полей (порядок)
-ALL_FIELDS = list(FIELD_DESCRIPTIONS.keys())
-
-
-# ── API ──────────────────────────────────────────────────────────────────────
-
-def auth_params(email, token):
-    """Общие параметры авторизации для всех запросов."""
-    return {"user_email": email, "user_token": token}
-
-
-def get_sites(email, token):
-    """Получить список всех проектов из API."""
-    resp = requests.get(
-        f"{BASE_URL}/get_sites", params=auth_params(email, token), timeout=30
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("sites", [])
-
-
-def get_statistics(site_id, date1_str, date2_str, email, token):
-    """Получить статистику по проекту за указанный период (макс 7 дней)."""
-    params = {
-        **auth_params(email, token),
-        "site_id": site_id,
-        "date1": date1_str,
-        "date2": date2_str,
-    }
-    resp = requests.get(
-        f"{BASE_URL}/site_get_statistics", params=params, timeout=60
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def test_connection(email, token):
-    """Проверка подключения к API. Возвращает (success, site_count, message)."""
-    try:
-        ok, msg = check_credentials(email, token)
-        if not ok:
-            return False, 0, msg
-        sites = get_sites(email, token)
-        return True, len(sites), f"Подключено. Проектов: {len(sites)}"
-    except Exception as e:
-        return False, 0, f"Ошибка подключения: {e}"
-
-
-def get_channels_and_statuses(site_id, email, token):
-    """Запрашиваем статистику за последние 7 дней и извлекаем имена каналов и статусы.
-    7 дней — максимальный период одного запроса API, даёт надёжный результат
-    даже если в последние 1-2 дня обращений не было.
-    Возвращает (channel_names: list[str], statuses: list[str])."""
-    today = datetime.now()
-    week_ago = today - timedelta(days=6)
-    d1 = week_ago.strftime("%d.%m.%Y")
-    d2 = today.strftime("%d.%m.%Y")
-    data = get_statistics(site_id, d1, d2, email, token)
-
-    channels = data.get("channels_statistics", [])
-    channel_names = []
-    statuses = set()
-    for ch in channels:
-        name = ch.get("name_channel", "")
-        if name:
-            channel_names.append(name)
-        for atype in APPEAL_TYPES:
-            for appeal in ch.get(atype, []):
-                s = appeal.get("status", "")
-                if s:
-                    statuses.add(s)
-    return channel_names, sorted(statuses)
-
-
-# ── Парсинг данных ───────────────────────────────────────────────────────────
-
-def build_row(appeal, ch_name, atype, columns):
-    """Собираем строку из записи обращения по списку запрошенных колонок."""
-    row = {}
-    for col in columns:
-        if col == "date":
-            row[col] = format_date(appeal.get("date"))
-        elif col == "name_channel":
-            row[col] = ch_name
-        elif col == "type":
-            row[col] = atype
-        else:
-            row[col] = appeal.get(col, "") or ""
-    return row
-
-
-def parse_chunk_data(data, channel_filter, seen_ids, columns=None,
-                     type_filter=None, status_filter=None):
-    """
-    Парсим ответ одного чанка в rows_by_channel.
-    Возвращает dict {channel_name: [rows]} и кол-во записей в чанке.
-    """
-    if columns is None:
-        columns = DEFAULT_COLUMNS
-
-    appeal_types = type_filter or APPEAL_TYPES
-    channels = data.get("channels_statistics", [])
-    rows_by_channel = {}
-    chunk_count = 0
-
-    for channel in channels:
-        ch_name = channel.get("name_channel", "")
-        if channel_filter and ch_name not in channel_filter:
-            continue
-
-        channel_rows = []
-        for atype in appeal_types:
-            appeals = channel.get(atype, [])
-            if not appeals:
-                continue
-            for appeal in appeals:
-                appeal_id = extract_appeal_id(appeal)
-                if appeal_id and appeal_id in seen_ids:
-                    continue
-                if appeal_id:
-                    seen_ids.add(appeal_id)
-                if status_filter and (appeal.get("status", "") or "") not in status_filter:
-                    continue
-                channel_rows.append(build_row(appeal, ch_name, atype, columns))
-
-        if channel_rows:
-            rows_by_channel[ch_name] = channel_rows
-            chunk_count += len(channel_rows)
-
-    return rows_by_channel, chunk_count
-
-
-# ── Запросы с retry ──────────────────────────────────────────────────────────
-
-def _emit(on_log, message):
-    """Отправить сообщение в callback или в logging."""
-    if on_log:
-        on_log(message)
-    else:
-        log.info(message)
-
-
-def fetch_chunk_with_retry(site_id, d1, d2, idx, total_chunks,
-                           email, token, on_log=None):
-    """Запрос чанка с повторными попытками. Возвращает data или None."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            data = get_statistics(site_id, d1, d2, email, token)
-            return data
-        except requests.HTTPError as e:
-            _emit(on_log, f"    Чанк {idx}/{total_chunks} ({d1}—{d2}): HTTP ошибка — {e} (попытка {attempt}/{MAX_RETRIES})")
-        except requests.RequestException as e:
-            _emit(on_log, f"    Чанк {idx}/{total_chunks} ({d1}—{d2}): сетевая ошибка — {e} (попытка {attempt}/{MAX_RETRIES})")
-
-        if attempt < MAX_RETRIES:
-            pause = attempt * 2
-            _emit(on_log, f"    Повторная попытка через {pause}с...")
-            time.sleep(pause)
-
-    _emit(on_log, f"    Чанк {idx}/{total_chunks} ({d1}—{d2}): все {MAX_RETRIES} попытки исчерпаны — пропускаем")
-    return None
-
-
-# ── Обработка проекта ────────────────────────────────────────────────────────
-
-def process_site(site, chunks, email, token, channel_filter=None, columns=None,
-                 type_filter=None, status_filter=None, on_log=None, on_chunk=None):
-    """
-    Обработка одного проекта за весь период.
-    on_chunk(current_chunk, total_chunks) — callback прогресса по чанкам.
-    Возвращает (успех, {channel_name: [rows]}, failed_chunks).
-    """
-    site_id = site.get("site_id")
-    total_chunks = len(chunks)
-
-    merged = {}
-    seen_ids = set()
-    has_data = False
-    failed_chunks = 0
-
-    for idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        d1 = chunk_start.strftime("%d.%m.%Y")
-        d2 = chunk_end.strftime("%d.%m.%Y")
-
-        data = fetch_chunk_with_retry(site_id, d1, d2, idx, total_chunks,
-                                      email, token, on_log)
-        if data is None:
-            failed_chunks += 1
-            if on_chunk:
-                on_chunk(idx, total_chunks)
-            continue
-
-        chunk_rows, chunk_count = parse_chunk_data(
-            data, channel_filter, seen_ids, columns, type_filter, status_filter
-        )
-
-        for ch_name, rows in chunk_rows.items():
-            merged.setdefault(ch_name, []).extend(rows)
-
-        has_data = True
-        _emit(on_log, f"    Чанк {idx}/{total_chunks}: {d1} — {d2} — {chunk_count} записей")
-
-        if on_chunk:
-            on_chunk(idx, total_chunks)
-
-        if idx < total_chunks:
-            time.sleep(0.5)
-
-    return has_data, merged, failed_chunks
+def get_project_provider(proj_conf):
+    """Вернуть модуль провайдера для проекта (по ключу 'provider', дефолт callibri)."""
+    return providers.get_provider(proj_conf.get("provider"))
 
 
 # ── Запись файлов ────────────────────────────────────────────────────────────
 
-def write_csv(filepath, rows, columns=None):
-    """Записываем CSV с заголовком (разделитель ;, UTF-8 BOM)."""
-    if columns is None:
-        columns = DEFAULT_COLUMNS
+# Префиксы, которые Excel/LibreOffice интерпретирует как формулу.
+# Значение из API, начинающееся на один из них, потенциально выполнит
+# произвольную формулу у получателя файла (CSV/Formula Injection).
+_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Экранировать значение от формула-инъекции в CSV/XLSX."""
+    if value is None:
+        return ""
+    s = str(value)
+    if s.startswith(_FORMULA_PREFIX):
+        return "'" + s
+    return s
+
+
+def write_csv(filepath, rows, columns):
+    """CSV с заголовком (разделитель ;, UTF-8 BOM). Защита от формула-инъекции."""
     with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore", delimiter=";")
-        writer.writeheader()
-        writer.writerows(rows)
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([_csv_safe(row.get(col, "")) for col in columns])
 
 
-def write_xlsx(filepath, rows, columns=None):
-    """Записываем XLSX с заголовком и автошириной колонок."""
-    if columns is None:
-        columns = DEFAULT_COLUMNS
-
+def write_xlsx(filepath, rows, columns):
+    """XLSX с заголовком и автошириной колонок. Защита от формула-инъекции."""
     wb = Workbook()
     ws = wb.active
 
@@ -431,7 +139,7 @@ def write_xlsx(filepath, rows, columns=None):
         cell.alignment = Alignment(horizontal="center")
 
     for row in rows:
-        ws.append([row.get(col, "") for col in columns])
+        ws.append([_csv_safe(row.get(col, "")) for col in columns])
 
     for col_cells in ws.columns:
         max_len = max((len(str(c.value)) if c.value else 0) for c in col_cells)
@@ -440,165 +148,248 @@ def write_xlsx(filepath, rows, columns=None):
     wb.save(filepath)
 
 
+# ── Google Sheets ───────────────────────────────────────────────────────────
+
+def _emit(on_log, message):
+    if on_log:
+        on_log(message)
+    else:
+        log.info(message)
+
+
+def _export_to_gsheet(credentials_path, gsheet_conf, rows, columns, on_log):
+    """Отправка данных в Google Sheets. Ошибки не прерывают экспорт."""
+    try:
+        import gsheets as gs
+    except ImportError:
+        _emit(on_log, "  Google Sheets: пакеты gspread/google-auth не установлены — пропускаем")
+        return
+
+    spreadsheet_id = gsheet_conf.get("spreadsheet_id", "")
+    sheet_name = gsheet_conf.get("sheet_name", "")
+    mode = gsheet_conf.get("mode", "append")
+
+    if not spreadsheet_id or not sheet_name:
+        _emit(on_log, "  Google Sheets: не указана таблица или лист — пропускаем")
+        return
+
+    try:
+        client = gs.authorize(credentials_path)
+        gs.export_to_sheet(
+            client, spreadsheet_id, sheet_name,
+            rows, columns, mode=mode, on_log=on_log,
+        )
+    except Exception as e:
+        _emit(on_log, f"  Google Sheets: Ошибка — {e}")
+
+
 # ── Главная функция экспорта ─────────────────────────────────────────────────
 
 def run_export(
-    email, token,
+    credentials,
     date1_str=None, date2_str=None, days=None,
     projects_path=None,
     output_dir=None,
-    enabled_site_ids=None,
+    enabled_keys=None,
     on_log=None,
     on_progress=None,
+    gsheet_credentials=None,
 ):
     """
     Главная функция экспорта.
 
     Параметры:
-    - email, token: учётные данные Callibri
-    - date1_str, date2_str: период (dd.mm.yyyy), или days для последних N дней
-    - projects_path: путь к projects.json (None = рядом с приложением)
-    - output_dir: папка для результатов (None = output/ рядом с приложением)
-    - enabled_site_ids: set of site_id (если передан — переопределяет enabled из json)
-    - on_log(message): callback для логирования
-    - on_progress(current_project, total_projects, current_chunk, total_chunks):
-      callback для прогресса
+      credentials — dict: {provider_name: {field: value}}
+        Пример: {"callibri": {"email": "...", "token": "..."}}
+      date1_str, date2_str — период (dd.mm.yyyy), или days для последних N дней
+      projects_path — путь к projects.json (None = рядом с приложением)
+      output_dir — папка результатов (None = output/ рядом с приложением)
+      enabled_keys — set of (provider_name, site_id) tuples; если передан —
+        переопределяет "enabled" из конфига
+      on_log(msg) — callback логов
+      on_progress(project_idx, total_projects, chunk_idx, total_chunks) — прогресс
+      gsheet_credentials — путь к credentials.json для Google Sheets
 
     Бросает ValueError при ошибках валидации.
     Возвращает dict с результатами.
     """
-    # 1. Проверка учётных данных
-    ok, msg = check_credentials(email, token)
-    if not ok:
-        raise ValueError(msg)
-
-    # 2. Определяем период
+    # 1. Период
     date1, date2 = resolve_period(date1_str, date2_str, days)
-    chunks = split_period(date1, date2)
-    _emit(on_log, f"Период: {date1.strftime('%d.%m.%Y')} — {date2.strftime('%d.%m.%Y')} ({len(chunks)} чанков)")
+    _emit(on_log, f"Период: {date1.strftime('%d.%m.%Y')} — {date2.strftime('%d.%m.%Y')}")
 
-    # 3. Загружаем конфигурацию
+    # 2. Загружаем конфигурацию
     projects_config = load_projects(projects_path)
     _emit(on_log, f"Проектов в конфиге: {len(projects_config)}")
 
-    # 4. Загружаем проекты из API
-    _emit(on_log, "Загружаем список проектов из API...")
-    all_sites = get_sites(email, token)
-    sites_lookup = {s["site_id"]: s for s in all_sites}
+    # 3. Определяем активные проекты и валидируем учётные данные для них
+    def _is_enabled(proj):
+        provider_name = proj.get("provider", "callibri")
+        site_id = proj.get("site_id")
+        if enabled_keys is not None:
+            return (provider_name, site_id) in enabled_keys
+        return proj.get("enabled", True)
 
+    active_projects = [p for p in projects_config if _is_enabled(p)]
+
+    # 4. Кэш list_sites per-provider (чтобы не звать API несколько раз)
+    sites_cache = {}   # provider_name -> {site_id: site_dict}
+
+    def _get_sites_lookup(provider):
+        if provider.NAME not in sites_cache:
+            _emit(on_log, f"Загружаем список проектов из API [{provider.LABEL}]...")
+            creds = credentials.get(provider.NAME) or {}
+            sites = provider.list_sites(creds)
+            sites_cache[provider.NAME] = {s.get("site_id"): s for s in sites}
+        return sites_cache[provider.NAME]
+
+    # 5. Выгрузка
     if output_dir is None:
         output_dir = os.path.join(get_app_dir(), "output")
-    date_suffix = f"callibri_{date1.strftime('%d%m%Y')}-{date2.strftime('%d%m%Y')}"
+    date_suffix = f"{date1.strftime('%d%m%Y')}-{date2.strftime('%d%m%Y')}"
 
-    # 5. Предпроверка
-    active_projects = []
-    for p in projects_config:
-        sid = p.get("site_id")
-        if enabled_site_ids is not None:
-            enabled = sid in enabled_site_ids
-        else:
-            enabled = p.get("enabled", True)
-        if enabled:
-            active_projects.append(p)
-
-    missing = [p for p in active_projects if p.get("site_id") not in sites_lookup]
-    if missing:
-        for p in missing:
-            _emit(on_log, f"ПРЕДУПРЕЖДЕНИЕ: site_id={p.get('site_id')} (folder={p.get('folder')}) не найден в API")
-        _emit(on_log, f"Не найдено проектов: {len(missing)} из {len(active_projects)} активных")
-
-    # 6. Цикл по проектам
     processed = 0
     disabled = 0
     errors = 0
     total_failed_chunks = 0
     report = []
     total_active = len(active_projects)
+    project_idx_among_active = 0
 
-    for i, proj_conf in enumerate(projects_config):
+    for proj_conf in projects_config:
+        provider_name = proj_conf.get("provider", "callibri")
         site_id = proj_conf.get("site_id")
         folder = proj_conf.get("folder")
-        channel_filter = proj_conf.get("channels")
-        split_by_channel = proj_conf.get("split_by_channel", False)
-        columns = proj_conf.get("fields") or DEFAULT_COLUMNS
-        type_filter = proj_conf.get("types")
-        status_filter = proj_conf.get("statuses")
-        out_format = proj_conf.get("format", "xlsx")
 
-        # Определяем enabled
-        if enabled_site_ids is not None:
-            enabled = site_id in enabled_site_ids
-        else:
-            enabled = proj_conf.get("enabled", True)
-
-        if not enabled:
+        if not _is_enabled(proj_conf):
             disabled += 1
             continue
 
-        if site_id not in sites_lookup:
+        try:
+            provider = providers.get_provider(provider_name)
+        except ValueError as e:
+            _emit(on_log, f"ОШИБКА: {e} (site_id={site_id}, folder={folder})")
             errors += 1
             continue
 
-        site = sites_lookup[site_id]
-        site_name = site.get("sitename", str(site_id))
-        _emit(on_log, f"Обрабатываем: {site_name} (id={site_id}) → output/{folder}/")
+        creds = credentials.get(provider.NAME) or {}
+        ok, msg = provider.check_credentials(creds)
+        if not ok:
+            _emit(on_log, f"ОШИБКА [{provider.LABEL}]: {msg} (folder={folder})")
+            errors += 1
+            continue
 
+        manual_only = getattr(provider, "REQUIRES_MANUAL_SITE_ID", False)
+        if manual_only:
+            site = {"site_id": site_id, "sitename": proj_conf.get("name") or folder or str(site_id)}
+        else:
+            try:
+                sites_lookup = _get_sites_lookup(provider)
+            except Exception as e:
+                _emit(on_log, f"ОШИБКА загрузки списка [{provider.LABEL}]: {e}")
+                errors += 1
+                continue
+
+            if site_id not in sites_lookup:
+                _emit(on_log, f"ПРЕДУПРЕЖДЕНИЕ: site_id={site_id} (folder={folder}) не найден в {provider.LABEL}")
+                errors += 1
+                continue
+
+            site = sites_lookup[site_id]
+
+        site_name = site.get("sitename") or site.get("name") or str(site_id)
+
+        channel_filter = proj_conf.get("channels")
+        columns = proj_conf.get("fields") or list(provider.DEFAULT_COLUMNS)
+        type_filter = proj_conf.get("types")
+        status_filter = proj_conf.get("statuses")
+        split_by_channel = proj_conf.get("split_by_channel", False)
+        out_format = proj_conf.get("format", "xlsx")
+        file_export = proj_conf.get("file_export", True)
+
+        _emit(on_log, f"[{provider.LABEL}] {site_name} (id={site_id}) → output/{folder}/")
         if channel_filter:
             _emit(on_log, f"  Фильтр каналов: {channel_filter}")
         if type_filter:
             _emit(on_log, f"  Фильтр типов: {type_filter}")
         if status_filter:
             _emit(on_log, f"  Фильтр статусов: {status_filter}")
-        if columns != DEFAULT_COLUMNS:
+        if columns != list(provider.DEFAULT_COLUMNS):
             _emit(on_log, f"  Поля: {columns}")
 
         # Callback прогресса по чанкам
-        project_idx = processed  # номер среди активных
-        def _on_chunk(cur_chunk, tot_chunks, _pi=project_idx):
+        _pi = project_idx_among_active
+
+        def _on_chunk(cur_chunk, tot_chunks, _pi=_pi):
             if on_progress:
                 on_progress(_pi, total_active, cur_chunk, tot_chunks)
 
-        ok_data, rows_by_channel, failed_chunks = process_site(
-            site, chunks, email, token, channel_filter, columns,
-            type_filter, status_filter, on_log, _on_chunk
-        )
-        total_failed_chunks += failed_chunks
+        filters = {
+            "channels": channel_filter,
+            "columns": columns,
+            "types": type_filter,
+            "statuses": status_filter,
+        }
 
-        if not ok_data:
+        try:
+            has_data, rows_by_channel, failed_chunks = provider.process_site(
+                site, date1, date2, creds, filters, on_log, _on_chunk
+            )
+        except Exception as e:
+            _emit(on_log, f"ОШИБКА при выгрузке [{provider.LABEL}] {folder}: {e}")
             errors += 1
-            report.append((site_name, 0))
+            project_idx_among_active += 1
             continue
 
-        project_dir = os.path.join(output_dir, folder)
-        os.makedirs(project_dir, exist_ok=True)
+        total_failed_chunks += failed_chunks
 
-        write_fn = write_csv if out_format == "csv" else write_xlsx
-        ext = out_format
+        if not has_data:
+            errors += 1
+            report.append((site_name, 0))
+            project_idx_among_active += 1
+            continue
 
-        if split_by_channel:
-            project_total = 0
-            for ch_name, rows in rows_by_channel.items():
-                rows.sort(key=lambda r: r.get("date", ""))
-                safe_name = sanitize_filename(ch_name)
-                filepath = os.path.join(project_dir, f"{date_suffix}_{safe_name}.{ext}")
-                write_fn(filepath, rows, columns)
-                _emit(on_log, f"  [{ch_name}] → {len(rows)} строк → {os.path.basename(filepath)}")
-                project_total += len(rows)
+        all_rows = [row for rows in rows_by_channel.values() for row in rows]
+        all_rows.sort(key=lambda r: r.get("date", ""))
+        project_total = len(all_rows)
+
+        # Файл
+        if file_export:
+            project_dir = os.path.join(output_dir, folder)
+            os.makedirs(project_dir, exist_ok=True)
+
+            write_fn = write_csv if out_format == "csv" else write_xlsx
+            ext = out_format
+            prefix = f"{provider.NAME}_{date_suffix}"
+
+            if split_by_channel:
+                for ch_name, rows in rows_by_channel.items():
+                    rows.sort(key=lambda r: r.get("date", ""))
+                    safe_name = sanitize_filename(ch_name)
+                    filepath = os.path.join(project_dir, f"{prefix}_{safe_name}.{ext}")
+                    write_fn(filepath, rows, columns)
+                    _emit(on_log, f"  [{ch_name}] → {len(rows)} строк → {os.path.basename(filepath)}")
+            else:
+                filepath = os.path.join(project_dir, f"{prefix}.{ext}")
+                write_fn(filepath, all_rows, columns)
+                _emit(on_log, f"  Сохранено: {project_total} строк → {os.path.basename(filepath)}")
         else:
-            all_rows = [row for rows in rows_by_channel.values() for row in rows]
-            all_rows.sort(key=lambda r: r.get("date", ""))
-            filepath = os.path.join(project_dir, f"{date_suffix}.{ext}")
-            write_fn(filepath, all_rows, columns)
-            _emit(on_log, f"  Сохранено: {len(all_rows)} строк → {os.path.basename(filepath)}")
-            project_total = len(all_rows)
+            _emit(on_log, f"  Файловый экспорт выключен — {project_total} строк")
 
         if failed_chunks:
             _emit(on_log, f"  Внимание: {failed_chunks} чанк(ов) не удалось загрузить — данные неполные")
 
+        # Google Sheets
+        gsheet_conf = proj_conf.get("gsheet")
+        if (gsheet_conf and gsheet_conf.get("enabled")
+                and gsheet_credentials and all_rows):
+            _export_to_gsheet(
+                gsheet_credentials, gsheet_conf, all_rows, columns, on_log
+            )
+
         report.append((site_name, project_total))
         processed += 1
+        project_idx_among_active += 1
 
-    # Итог
     result = {
         "processed": processed,
         "disabled": disabled,

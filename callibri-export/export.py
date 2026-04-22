@@ -1,6 +1,6 @@
 """
-export.py — CLI-обёртка для экспорта обращений из Callibri.
-Вся бизнес-логика — в core.py.
+export.py — CLI-обёртка для экспорта обращений.
+Вся бизнес-логика — в core.py и providers/.
 """
 
 import os
@@ -14,29 +14,45 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import core
+import providers
+
+
+def _build_credentials():
+    """Собрать dict учётных данных из переменных окружения.
+
+    Для каждого провайдера подтягиваются переменные, описанные в его
+    CREDENTIAL_FIELDS (ключ "env" → имя переменной окружения).
+    """
+    creds = {}
+    for prov in providers.all_providers():
+        prov_creds = {}
+        for field in getattr(prov, "CREDENTIAL_FIELDS", []):
+            env_name = field.get("env")
+            if env_name:
+                prov_creds[field["key"]] = os.getenv(env_name, "")
+        creds[prov.NAME] = prov_creds
+    return creds
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Экспорт обращений из Callibri")
+    parser = argparse.ArgumentParser(description="Экспорт обращений (Callibri / Calltouch)")
     parser.add_argument("--date1", help="Начальная дата (dd.mm.yyyy)")
     parser.add_argument("--date2", help="Конечная дата (dd.mm.yyyy)")
     parser.add_argument("--days", type=int, help="Последние N дней (вместо --date1/--date2)")
     args = parser.parse_args()
 
-    # Настройка логирования
+    # Логирование
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
         logging.Formatter("%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
     )
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
-    email = os.getenv("CALLIBRI_EMAIL")
-    token = os.getenv("CALLIBRI_TOKEN")
+    credentials = _build_credentials()
 
     try:
         result = core.run_export(
-            email=email,
-            token=token,
+            credentials=credentials,
             date1_str=args.date1,
             date2_str=args.date2,
             days=args.days,
@@ -51,7 +67,7 @@ def main():
         if result["errors"]:
             print(f"  Ошибки              : {result['errors']}")
         if result["failed_chunks"]:
-            print(f"  Пропущено чанков    : {result['failed_chunks']} (после {core.MAX_RETRIES} попыток)")
+            print(f"  Пропущено чанков    : {result['failed_chunks']}")
         if result["report"]:
             print()
             for name, count in result["report"]:

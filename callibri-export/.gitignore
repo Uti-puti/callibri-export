@@ -1,5 +1,6 @@
 .env
 projects.json
+credentials.json
 venv/
 output/
 __pycache__/

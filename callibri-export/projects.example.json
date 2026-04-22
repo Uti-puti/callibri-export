@@ -1,8 +1,23 @@
 [
   {
+    "provider": "callibri",
     "site_id": 12345,
-    "folder": "my-project",
+    "folder": "my-callibri-project",
     "channels": ["Контекст"],
+    "split_by_channel": false,
+    "enabled": true,
+    "gsheet": {
+      "enabled": false,
+      "spreadsheet_id": "",
+      "sheet_name": "Лист1",
+      "mode": "append"
+    }
+  },
+  {
+    "provider": "calltouch",
+    "site_id": 67890,
+    "folder": "my-calltouch-project",
+    "types": ["calls", "requests"],
     "split_by_channel": false,
     "enabled": true
   }

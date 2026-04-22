@@ -7,12 +7,163 @@ import os
 import sys
 import queue
 import threading
+import calendar
 from datetime import datetime, timedelta
+from tkinter import filedialog
 
 import customtkinter as ctk
 from dotenv import load_dotenv
 
 import core
+import providers
+
+# Ленивый импорт gsheets — может отсутствовать если пакеты не установлены
+try:
+    import gsheets as gs
+    HAS_GSHEETS = True
+except ImportError:
+    gs = None
+    HAS_GSHEETS = False
+
+
+# ── Диалог выбора даты (календарь) ──────────────────────────────────────────
+
+class DatePickerDialog(ctk.CTkToplevel):
+    MONTH_NAMES = [
+        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    ]
+    WEEKDAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    def __init__(self, parent, initial_date=None, on_select=None):
+        super().__init__(parent)
+        self.title("Выбор даты")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.on_select = on_select
+
+        today = datetime.now()
+        d = initial_date or today
+        self._year = d.year
+        self._month = d.month
+        self._selected_day = d.day if (d.year == today.year and d.month == today.month) else None
+
+        self._build_ui()
+        self._render_month()
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            self.geometry(f"+{px + 100}+{py + 100}")
+        except Exception:
+            pass
+
+        self.grab_set()
+        self.focus()
+
+    def _build_ui(self):
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkButton(header, text="‹", width=32, command=self._prev_month).pack(side="left")
+
+        self.lbl_title = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=14, weight="bold"))
+        self.lbl_title.pack(side="left", expand=True, fill="x", padx=8)
+
+        ctk.CTkButton(header, text="›", width=32, command=self._next_month).pack(side="left")
+
+        self.grid_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.grid_frame.pack(padx=8, pady=4)
+
+        for col, name in enumerate(self.WEEKDAY_NAMES):
+            color = ("red3", "red") if col >= 5 else ("gray30", "gray70")
+            ctk.CTkLabel(
+                self.grid_frame, text=name, width=36, height=24,
+                text_color=color, font=ctk.CTkFont(size=11, weight="bold"),
+            ).grid(row=0, column=col, padx=1, pady=1)
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=8, pady=(4, 8))
+
+        ctk.CTkButton(
+            footer, text="Сегодня", width=80, height=26,
+            fg_color="transparent", border_width=1, text_color=("gray10", "gray90"),
+            command=self._pick_today,
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            footer, text="Отмена", width=80, height=26,
+            fg_color="transparent", border_width=1, text_color=("gray10", "gray90"),
+            command=self.destroy,
+        ).pack(side="right")
+
+    def _render_month(self):
+        self.lbl_title.configure(text=f"{self.MONTH_NAMES[self._month - 1]} {self._year}")
+
+        for widget in self.grid_frame.grid_slaves():
+            info = widget.grid_info()
+            if int(info.get("row", 0)) > 0:
+                widget.destroy()
+
+        cal = calendar.Calendar(firstweekday=0)
+        weeks = cal.monthdayscalendar(self._year, self._month)
+        today = datetime.now().date()
+
+        for row_idx, week in enumerate(weeks, start=1):
+            for col_idx, day in enumerate(week):
+                if day == 0:
+                    continue
+                is_today = (day == today.day and self._month == today.month and self._year == today.year)
+                is_selected = (day == self._selected_day)
+
+                if is_selected:
+                    fg_color = ("gray25", "gray75")
+                elif is_today:
+                    fg_color = ("#1f6aa5", "#144870")
+                else:
+                    fg_color = "transparent"
+
+                btn = ctk.CTkButton(
+                    self.grid_frame, text=str(day), width=36, height=28,
+                    fg_color=fg_color,
+                    border_width=0 if fg_color != "transparent" else 1,
+                    text_color=("gray10", "gray90"),
+                    command=lambda d=day: self._pick_day(d),
+                )
+                btn.grid(row=row_idx, column=col_idx, padx=1, pady=1)
+
+    def _prev_month(self):
+        if self._month == 1:
+            self._month = 12
+            self._year -= 1
+        else:
+            self._month -= 1
+        self._selected_day = None
+        self._render_month()
+
+    def _next_month(self):
+        if self._month == 12:
+            self._month = 1
+            self._year += 1
+        else:
+            self._month += 1
+        self._selected_day = None
+        self._render_month()
+
+    def _pick_day(self, day):
+        try:
+            picked = datetime(self._year, self._month, day)
+        except ValueError:
+            return
+        if self.on_select:
+            self.on_select(picked)
+        self.destroy()
+
+    def _pick_today(self):
+        if self.on_select:
+            self.on_select(datetime.now())
+        self.destroy()
 
 
 # ── Диалог настроек проекта (поля + фильтры) ────────────────────────────────
@@ -20,33 +171,37 @@ import core
 class ProjectSettingsDialog(ctk.CTkToplevel):
     """Диалог редактирования полей и фильтров одного проекта."""
 
-    def __init__(self, parent, proj_conf, email, token):
+    def __init__(self, parent, proj_conf, provider, creds, gsheet_credentials=None):
         super().__init__(parent)
         self.proj_conf = proj_conf
-        self.email = email
-        self.token = token
+        self.provider = provider
+        self.creds = creds or {}
+        self.gsheet_credentials = gsheet_credentials  # путь к credentials.json
         self.result = None  # будет dict с обновлёнными настройками
 
         site_id = proj_conf.get("site_id")
         folder = proj_conf.get("folder", "")
-        self.title(f"Настройки — {folder} ({site_id})")
+        self.title(f"Настройки [{provider.LABEL}] — {folder} ({site_id})")
         self.geometry("680x650")
         self.minsize(580, 520)
         self.grab_set()
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)  # tabview растягивается, кнопки прижаты вниз
 
         # --- Вкладки ---
         self.tabview = ctk.CTkTabview(self)
         self.tabview.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
         self.tabview.grid_rowconfigure(0, weight=1)
+        self.tabview.grid_columnconfigure(0, weight=1)
 
         tab_fields = self.tabview.add("Поля")
         tab_filters = self.tabview.add("Фильтры")
+        tab_gsheet = self.tabview.add("Google Sheets")
 
         self._build_fields_tab(tab_fields)
         self._build_filters_tab(tab_filters)
+        self._build_gsheet_tab(tab_gsheet)
 
         # --- Кнопки ---
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -66,8 +221,8 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         tab.grid_columnconfigure(2, weight=1)
         tab.grid_rowconfigure(1, weight=1)
 
-        current_fields = list(self.proj_conf.get("fields") or core.DEFAULT_COLUMNS)
-        available = [f for f in core.ALL_FIELDS if f not in current_fields]
+        current_fields = list(self.proj_conf.get("fields") or self.provider.DEFAULT_COLUMNS)
+        available = [f for f in self.provider.ALL_FIELDS if f not in current_fields]
 
         # Заголовки
         ctk.CTkLabel(tab, text="Доступные поля").grid(row=0, column=0, pady=(4, 2))
@@ -110,7 +265,7 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
 
     def _field_display(self, field_name):
         """Форматируем поле для отображения в списке: 'name — описание'."""
-        desc = core.FIELD_DESCRIPTIONS.get(field_name, "")
+        desc = self.provider.FIELD_DESCRIPTIONS.get(field_name, "")
         if desc:
             return f"{field_name}  —  {desc}"
         return field_name
@@ -152,7 +307,7 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         """При клике на поле — показать полное описание внизу."""
         _, field = self._get_selected_line(textbox)
         if field:
-            desc = core.FIELD_DESCRIPTIONS.get(field, "Нет описания")
+            desc = self.provider.FIELD_DESCRIPTIONS.get(field, "Нет описания")
             self.lbl_field_desc.configure(
                 text=f"{field}:  {desc}",
                 text_color=("gray10", "gray90"),
@@ -195,53 +350,58 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
                 self.lst_selected.mark_set("insert", f"{line_num + 1}.0")
 
     def _reset_fields(self):
-        self._selected_fields = list(core.DEFAULT_COLUMNS)
-        self._available_fields = [f for f in core.ALL_FIELDS if f not in self._selected_fields]
+        self._selected_fields = list(self.provider.DEFAULT_COLUMNS)
+        self._available_fields = [f for f in self.provider.ALL_FIELDS if f not in self._selected_fields]
         self._refresh_field_lists()
 
     # ── Вкладка «Фильтры» ────────────────────────────────────────────────
 
     def _build_filters_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # Внутренний скролл на случай, если контент не помещается
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
 
         pad = {"padx": 10, "sticky": "w"}
 
         # --- Типы ---
-        ctk.CTkLabel(tab, text="Типы обращений", font=ctk.CTkFont(weight="bold")).grid(
+        ctk.CTkLabel(scroll, text="Типы обращений", font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, pady=(8, 4), **pad
         )
 
         current_types = self.proj_conf.get("types") or []
-        type_labels = {
-            "calls": "Звонки",
-            "feedbacks": "Заявки",
-            "chats": "Чаты",
-            "emails": "Email",
-        }
+        type_labels = self.provider.TYPE_LABELS
         self._type_vars = {}
         row = 1
         for key, label in type_labels.items():
             var = ctk.IntVar(value=1 if (not current_types or key in current_types) else 0)
-            ctk.CTkCheckBox(tab, text=label, variable=var).grid(row=row, column=0, **pad, pady=1)
+            ctk.CTkCheckBox(scroll, text=label, variable=var).grid(row=row, column=0, **pad, pady=1)
             self._type_vars[key] = var
             row += 1
 
         # --- Каналы ---
-        ctk.CTkLabel(tab, text="Каналы", font=ctk.CTkFont(weight="bold")).grid(
+        ctk.CTkLabel(scroll, text="Каналы", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, pady=(12, 4), **pad
         )
         row += 1
 
-        self._channels_frame = ctk.CTkScrollableFrame(tab, height=100)
+        self._channels_frame = ctk.CTkScrollableFrame(scroll, height=120)
         self._channels_frame.grid(row=row, column=0, sticky="ew", padx=10, pady=2)
         row += 1
 
         self._channel_vars = {}
+        # Флаг «полный список каналов загружен из API» — определяет,
+        # означает ли «все чекбоксы отмечены» снятие фильтра или нет.
+        # Без него сохранение без загрузки каналов затирает сохранённый фильтр.
+        self._channels_loaded_from_api = False
         current_channels = self.proj_conf.get("channels") or []
 
         # Кнопка загрузки каналов из API
         self._btn_load_channels = ctk.CTkButton(
-            tab, text="Загрузить каналы из API", width=200,
+            scroll, text="Загрузить каналы из API", width=200,
             command=self._load_channels,
         )
         self._btn_load_channels.grid(row=row, column=0, **pad, pady=4)
@@ -255,20 +415,20 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
                 self._channel_vars[ch] = var
 
         # --- Статусы ---
-        ctk.CTkLabel(tab, text="Статусы", font=ctk.CTkFont(weight="bold")).grid(
+        ctk.CTkLabel(scroll, text="Статусы", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, pady=(12, 4), **pad
         )
         row += 1
 
         current_statuses = self.proj_conf.get("statuses") or []
-        self.entry_statuses = ctk.CTkEntry(tab, width=400, placeholder_text="Лид, Целевой (через запятую, пусто = все)")
+        self.entry_statuses = ctk.CTkEntry(scroll, width=400, placeholder_text="Лид, Целевой (через запятую, пусто = все)")
         self.entry_statuses.grid(row=row, column=0, padx=10, sticky="ew", pady=2)
         if current_statuses:
             self.entry_statuses.insert(0, ", ".join(current_statuses))
         row += 1
 
         # --- Формат ---
-        ctk.CTkLabel(tab, text="Формат выгрузки", font=ctk.CTkFont(weight="bold")).grid(
+        ctk.CTkLabel(scroll, text="Формат выгрузки", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, pady=(12, 4), **pad
         )
         row += 1
@@ -276,13 +436,13 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         current_format = self.proj_conf.get("format", "xlsx")
         self._format_var = ctk.StringVar(value=current_format)
         ctk.CTkSegmentedButton(
-            tab, values=["xlsx", "csv"], variable=self._format_var, width=200,
+            scroll, values=["xlsx", "csv"], variable=self._format_var, width=200,
         ).grid(row=row, column=0, **pad, pady=2)
         row += 1
 
         # --- Split by channel ---
         self._split_var = ctk.IntVar(value=1 if self.proj_conf.get("split_by_channel", False) else 0)
-        ctk.CTkCheckBox(tab, text="Разделять файлы по каналам", variable=self._split_var).grid(
+        ctk.CTkCheckBox(scroll, text="Разделять файлы по каналам", variable=self._split_var).grid(
             row=row, column=0, **pad, pady=(12, 4)
         )
 
@@ -294,8 +454,8 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
 
         def _fetch():
             try:
-                channel_names, statuses = core.get_channels_and_statuses(
-                    site_id, self.email, self.token
+                channel_names, statuses = self.provider.get_channels_and_statuses(
+                    site_id, self.creds
                 )
                 self.after(0, lambda: self._show_channels(channel_names, current_channels, statuses))
             except Exception as e:
@@ -307,6 +467,7 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
 
     def _show_channels(self, channel_names, current_channels, statuses):
         self._btn_load_channels.configure(state="normal", text="Загрузить каналы из API")
+        self._channels_loaded_from_api = True
 
         # Обновляем чекбоксы каналов
         for w in self._channels_frame.winfo_children():
@@ -322,6 +483,205 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         if statuses and not self.entry_statuses.get().strip():
             self.entry_statuses.configure(placeholder_text=", ".join(statuses))
 
+    # ── Вкладка «Google Sheets» ────────────────────────────────────────────
+
+    def _build_gsheet_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        pad = {"padx": 10, "sticky": "w"}
+
+        gsheet_conf = self.proj_conf.get("gsheet") or {}
+
+        # --- Включение ---
+        self._gsheet_enabled_var = ctk.IntVar(value=1 if gsheet_conf.get("enabled") else 0)
+        ctk.CTkCheckBox(
+            scroll, text="Отправлять в Google Sheets", variable=self._gsheet_enabled_var,
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=0, pady=(12, 8), **pad)
+
+        # --- Таблица ---
+        ctk.CTkLabel(scroll, text="Таблица (URL или ID):", font=ctk.CTkFont(size=12)).grid(
+            row=1, column=0, pady=(4, 2), **pad
+        )
+
+        spreadsheet_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        spreadsheet_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=2)
+        spreadsheet_frame.grid_columnconfigure(0, weight=1)
+
+        self._gsheet_spreadsheet_entry = ctk.CTkEntry(
+            spreadsheet_frame, placeholder_text="URL или ID таблицы"
+        )
+        self._gsheet_spreadsheet_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        sid = gsheet_conf.get("spreadsheet_id", "")
+        if sid:
+            self._gsheet_spreadsheet_entry.insert(0, sid)
+
+        self._btn_load_sheets = ctk.CTkButton(
+            spreadsheet_frame, text="Загрузить листы", width=130,
+            command=self._on_load_sheets,
+        )
+        self._btn_load_sheets.grid(row=0, column=1)
+
+        # Название таблицы (отображение)
+        self._lbl_spreadsheet_title = ctk.CTkLabel(
+            scroll, text="", text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        self._lbl_spreadsheet_title.grid(row=3, column=0, **pad, pady=(0, 4))
+
+        # --- Лист ---
+        ctk.CTkLabel(scroll, text="Лист (вкладка):", font=ctk.CTkFont(size=12)).grid(
+            row=4, column=0, pady=(8, 2), **pad
+        )
+
+        sheet_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        sheet_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=2)
+        sheet_frame.grid_columnconfigure(0, weight=1)
+
+        self._gsheet_sheet_var = ctk.StringVar(value=gsheet_conf.get("sheet_name", ""))
+        self._gsheet_sheet_menu = ctk.CTkOptionMenu(
+            sheet_frame, variable=self._gsheet_sheet_var,
+            values=["(загрузите листы)"], width=200,
+        )
+        self._gsheet_sheet_menu.grid(row=0, column=0, sticky="w", padx=(0, 6))
+
+        # Если sheet_name уже задан — показать его
+        if gsheet_conf.get("sheet_name"):
+            self._gsheet_sheet_menu.configure(values=[gsheet_conf["sheet_name"]])
+            self._gsheet_sheet_var.set(gsheet_conf["sheet_name"])
+
+        self._btn_create_sheet = ctk.CTkButton(
+            sheet_frame, text="Создать новый", width=120,
+            command=self._on_create_sheet,
+        )
+        self._btn_create_sheet.grid(row=0, column=1)
+
+        # --- Режим ---
+        ctk.CTkLabel(scroll, text="Режим записи:", font=ctk.CTkFont(size=12)).grid(
+            row=6, column=0, pady=(12, 4), **pad
+        )
+
+        current_mode = gsheet_conf.get("mode", "append")
+        self._gsheet_mode_var = ctk.StringVar(value=current_mode)
+        ctk.CTkSegmentedButton(
+            scroll, values=["append", "replace"],
+            variable=self._gsheet_mode_var, width=250,
+        ).grid(row=7, column=0, **pad, pady=2)
+
+        mode_desc = ctk.CTkLabel(
+            scroll, text="append = дополнить данные  |  replace = заменить все данные",
+            text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        mode_desc.grid(row=8, column=0, **pad, pady=(0, 4))
+
+        # --- Файловый экспорт ---
+        file_export = self.proj_conf.get("file_export", True)
+        self._file_export_var = ctk.IntVar(value=1 if file_export else 0)
+        ctk.CTkCheckBox(
+            scroll, text="Сохранять в файл (XLSX/CSV)",
+            variable=self._file_export_var,
+        ).grid(row=9, column=0, pady=(12, 4), **pad)
+
+        file_hint = ctk.CTkLabel(
+            scroll, text="Если выключено — данные пойдут только в Google Sheets",
+            text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        file_hint.grid(row=10, column=0, **pad, pady=(0, 4))
+
+        # --- Подсказка ---
+        if not HAS_GSHEETS:
+            hint = ctk.CTkLabel(
+                scroll,
+                text="Пакеты gspread/google-auth не установлены.\npip install gspread google-auth",
+                text_color="red", font=ctk.CTkFont(size=11),
+            )
+            hint.grid(row=11, column=0, **pad, pady=(12, 4))
+        elif not self.gsheet_credentials:
+            hint = ctk.CTkLabel(
+                scroll,
+                text="Укажите путь к credentials.json в главном окне (секция Google Sheets)",
+                text_color="orange", font=ctk.CTkFont(size=11),
+            )
+            hint.grid(row=11, column=0, **pad, pady=(12, 4))
+
+    def _on_load_sheets(self):
+        """Загрузить список листов из таблицы."""
+        if not HAS_GSHEETS or not self.gsheet_credentials:
+            return
+
+        url_or_id = self._gsheet_spreadsheet_entry.get().strip()
+        if not url_or_id:
+            return
+
+        self._btn_load_sheets.configure(state="disabled", text="Загрузка...")
+
+        def _fetch():
+            try:
+                spreadsheet_id = gs.parse_spreadsheet_id(url_or_id)
+                client = gs.authorize(self.gsheet_credentials)
+                title, sheet_names = gs.get_spreadsheet_info(client, spreadsheet_id)
+                self.after(0, lambda: self._show_sheets(spreadsheet_id, title, sheet_names))
+            except Exception as e:
+                self.after(0, lambda: self._sheets_error(str(e)))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _show_sheets(self, spreadsheet_id, title, sheet_names):
+        self._btn_load_sheets.configure(state="normal", text="Загрузить листы")
+        self._lbl_spreadsheet_title.configure(text=f'Таблица: "{title}"')
+
+        # Обновляем entry — ставим чистый ID
+        self._gsheet_spreadsheet_entry.delete(0, "end")
+        self._gsheet_spreadsheet_entry.insert(0, spreadsheet_id)
+
+        # Обновляем выпадающий список листов
+        if sheet_names:
+            self._gsheet_sheet_menu.configure(values=sheet_names)
+            # Если текущий лист есть в списке — оставляем, иначе первый
+            if self._gsheet_sheet_var.get() not in sheet_names:
+                self._gsheet_sheet_var.set(sheet_names[0])
+
+    def _sheets_error(self, error_msg):
+        self._btn_load_sheets.configure(state="normal", text="Загрузить листы")
+        self._lbl_spreadsheet_title.configure(
+            text=f"Ошибка: {error_msg}", text_color="red"
+        )
+
+    def _on_create_sheet(self):
+        """Создать новый лист в таблице."""
+        if not HAS_GSHEETS or not self.gsheet_credentials:
+            return
+
+        spreadsheet_id = self._gsheet_spreadsheet_entry.get().strip()
+        if not spreadsheet_id:
+            return
+
+        dialog = ctk.CTkInputDialog(
+            text="Имя нового листа:", title="Создать лист"
+        )
+        sheet_name = dialog.get_input()
+        if not sheet_name or not sheet_name.strip():
+            return
+
+        sheet_name = sheet_name.strip()
+
+        try:
+            sid = gs.parse_spreadsheet_id(spreadsheet_id)
+            client = gs.authorize(self.gsheet_credentials)
+            gs.create_sheet(client, sid, sheet_name)
+            # Обновляем список
+            _, sheet_names = gs.get_spreadsheet_info(client, sid)
+            self._gsheet_sheet_menu.configure(values=sheet_names)
+            self._gsheet_sheet_var.set(sheet_name)
+        except Exception as e:
+            self._lbl_spreadsheet_title.configure(
+                text=f"Ошибка создания листа: {e}", text_color="red"
+            )
+
     # ── Сохранение ────────────────────────────────────────────────────────
 
     def _on_save(self):
@@ -329,28 +689,35 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
 
         # Поля
         fields = [f for f in self._selected_fields if f]
-        if fields and fields != list(core.DEFAULT_COLUMNS):
+        if fields and fields != list(self.provider.DEFAULT_COLUMNS):
             self.result["fields"] = fields
         else:
             self.result["fields"] = None  # удалить ключ = использовать default
 
         # Типы
         selected_types = [k for k, v in self._type_vars.items() if v.get()]
-        if len(selected_types) < 4:
+        if len(selected_types) < len(self._type_vars):
             self.result["types"] = selected_types
         else:
             self.result["types"] = None
 
         # Каналы
-        if self._channel_vars:
+        if self._channels_loaded_from_api:
+            # Полный список загружен из API — отметка о реальном выборе.
+            # «Все отмечены» или «ни один» → снять фильтр, иначе — список.
             selected_ch = [ch for ch, v in self._channel_vars.items() if v.get()]
             total_ch = len(self._channel_vars)
             if selected_ch and len(selected_ch) < total_ch:
                 self.result["channels"] = selected_ch
             else:
                 self.result["channels"] = None
+        elif self._channel_vars:
+            # Показаны только ранее сохранённые каналы — чекбоксы управляют
+            # лишь снятием из фильтра, не полной заменой.
+            selected_ch = [ch for ch, v in self._channel_vars.items() if v.get()]
+            self.result["channels"] = selected_ch if selected_ch else None
         else:
-            # Не трогаем если каналы не загружались
+            # Каналы вообще не трогали
             self.result["channels"] = self.proj_conf.get("channels")
 
         # Статусы
@@ -366,6 +733,75 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         # Split
         self.result["split_by_channel"] = bool(self._split_var.get())
 
+        # Файловый экспорт
+        self.result["file_export"] = bool(self._file_export_var.get())
+
+        # Google Sheets
+        gsheet_enabled = bool(self._gsheet_enabled_var.get())
+        gsheet_sid = self._gsheet_spreadsheet_entry.get().strip()
+        gsheet_sheet = self._gsheet_sheet_var.get().strip()
+        gsheet_mode = self._gsheet_mode_var.get()
+
+        if gsheet_enabled and gsheet_sid and gsheet_sheet:
+            try:
+                gsheet_sid = gs.parse_spreadsheet_id(gsheet_sid) if HAS_GSHEETS else gsheet_sid
+            except Exception:
+                pass
+            self.result["gsheet"] = {
+                "enabled": True,
+                "spreadsheet_id": gsheet_sid,
+                "sheet_name": gsheet_sheet,
+                "mode": gsheet_mode,
+            }
+        elif gsheet_sid or gsheet_sheet:
+            # Настроено частично — сохраняем но выключено
+            self.result["gsheet"] = {
+                "enabled": False,
+                "spreadsheet_id": gsheet_sid,
+                "sheet_name": gsheet_sheet,
+                "mode": gsheet_mode,
+            }
+        else:
+            self.result["gsheet"] = None  # удалить ключ
+
+        self.destroy()
+
+
+# ── Диалог выбора провайдера ────────────────────────────────────────────────
+
+class ProviderChoiceDialog(ctk.CTkToplevel):
+    """Выбор провайдера для нового проекта."""
+
+    def __init__(self, parent, provider_names):
+        super().__init__(parent)
+        self.result = None
+        self.title("Выбор провайдера")
+        self.geometry("320x200")
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self, text="Какой API использовать?",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(pady=(16, 8))
+
+        self._var = ctk.StringVar(value=provider_names[0])
+        for name in provider_names:
+            prov = providers.get_provider(name)
+            ctk.CTkRadioButton(
+                self, text=prov.LABEL, variable=self._var, value=name,
+            ).pack(anchor="w", padx=40, pady=2)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=16)
+        ctk.CTkButton(btn_frame, text="OK", width=100, command=self._ok).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btn_frame, text="Отмена", width=100,
+            fg_color="transparent", border_width=1,
+            command=self.destroy,
+        ).pack(side="left", padx=6)
+
+    def _ok(self):
+        self.result = self._var.get()
         self.destroy()
 
 
@@ -374,10 +810,12 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
 class AddProjectDialog(ctk.CTkToplevel):
     """Диалог добавления нового проекта из списка API."""
 
-    def __init__(self, parent, sites, existing_site_ids):
+    def __init__(self, parent, sites, existing_keys, provider_name="callibri"):
         super().__init__(parent)
         self.result = None
-        self.title("Добавить проект")
+        self.provider_name = provider_name
+        provider = providers.get_provider(provider_name)
+        self.title(f"Добавить проект [{provider.LABEL}]")
         self.geometry("500x400")
         self.minsize(400, 300)
         self.grab_set()
@@ -405,7 +843,7 @@ class AddProjectDialog(ctk.CTkToplevel):
             if isinstance(domains, list):
                 domains = ", ".join(domains)
 
-            already = " (уже добавлен)" if sid in existing_site_ids else ""
+            already = " (уже добавлен)" if (provider_name, sid) in existing_keys else ""
             label = f"{name} ({sid}) — {domains}{already}"
 
             rb = ctk.CTkRadioButton(
@@ -459,8 +897,100 @@ class AddProjectDialog(ctk.CTkToplevel):
             return
 
         self.result = {
+            "provider": self.provider_name,
             "site_id": site.get("site_id"),
             "folder": folder,
+            "split_by_channel": False,
+            "enabled": True,
+        }
+        self.destroy()
+
+
+# ── Диалог ручного добавления проекта (для Calltouch и др.) ─────────────────
+
+class ManualAddProjectDialog(ctk.CTkToplevel):
+    """Ручной ввод siteId + folder для провайдеров без /sites API."""
+
+    def __init__(self, parent, provider_name, existing_keys):
+        super().__init__(parent)
+        self.result = None
+        self.provider_name = provider_name
+        self.existing_keys = existing_keys
+
+        provider = providers.get_provider(provider_name)
+        self.title(f"Добавить проект [{provider.LABEL}]")
+        self.geometry("500x260")
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self, text=f"Ручной ввод — {provider.LABEL}",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(pady=(14, 4))
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Публичного списка сайтов у Calltouch нет.\n"
+                "siteId и название можно найти в ЛК Calltouch → Интеграции → API."
+            ),
+            text_color="gray", font=ctk.CTkFont(size=11), justify="center",
+        ).pack(pady=(0, 10))
+
+        form = ctk.CTkFrame(self, fg_color="transparent")
+        form.pack(fill="x", padx=20)
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="siteId:").grid(row=0, column=0, sticky="w", pady=4)
+        self.entry_site_id = ctk.CTkEntry(form, placeholder_text="например 67890")
+        self.entry_site_id.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        ctk.CTkLabel(form, text="Название:").grid(row=1, column=0, sticky="w", pady=4)
+        self.entry_name = ctk.CTkEntry(form, placeholder_text="для отображения в логе")
+        self.entry_name.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        ctk.CTkLabel(form, text="Папка:").grid(row=2, column=0, sticky="w", pady=4)
+        self.entry_folder = ctk.CTkEntry(form, placeholder_text="имя папки в output/")
+        self.entry_folder.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        self.lbl_error = ctk.CTkLabel(self, text="", text_color="red")
+        self.lbl_error.pack(pady=(4, 0))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=12)
+        ctk.CTkButton(btn_frame, text="Добавить", width=120, command=self._on_add).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btn_frame, text="Отмена", width=100,
+            fg_color="transparent", border_width=1,
+            command=self.destroy,
+        ).pack(side="left", padx=6)
+
+    def _on_add(self):
+        sid_raw = self.entry_site_id.get().strip()
+        name = self.entry_name.get().strip()
+        folder = self.entry_folder.get().strip()
+
+        if not sid_raw:
+            self.lbl_error.configure(text="Укажи siteId")
+            return
+        try:
+            site_id = int(sid_raw)
+        except ValueError:
+            self.lbl_error.configure(text="siteId должен быть числом")
+            return
+        if not folder:
+            self.lbl_error.configure(text="Укажи папку")
+            return
+
+        key = (self.provider_name, site_id)
+        if key in self.existing_keys:
+            self.lbl_error.configure(text="Такой проект уже добавлен")
+            return
+
+        self.result = {
+            "provider": self.provider_name,
+            "site_id": site_id,
+            "folder": folder,
+            "name": name or folder,
             "split_by_channel": False,
             "enabled": True,
         }
@@ -474,8 +1004,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Callibri Export")
-        self.geometry("660x780")
-        self.minsize(560, 620)
+        self.geometry("680x780")
+        self.minsize(560, 420)
 
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
@@ -484,6 +1014,7 @@ class App(ctk.CTk):
         self._projects_config = []
         self._project_widgets = []  # list of dicts per project
         self._api_sites = None  # кэш get_sites()
+        self._gsheet_credentials_path = ""  # путь к credentials.json
 
         self._build_ui()
         self._load_env()
@@ -494,12 +1025,18 @@ class App(ctk.CTk):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)  # лог растягивается
+        self.grid_rowconfigure(0, weight=1)  # скролл-контейнер растягивается
+
+        # Весь основной контент живёт в скроллируемом фрейме,
+        # чтобы окно можно было уменьшать без потери доступа к полям.
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid_columnconfigure(0, weight=1)
 
         pad = {"padx": 12, "pady": (6, 0)}
 
         # --- Подключение ---
-        frame_conn = ctk.CTkFrame(self)
+        frame_conn = ctk.CTkFrame(scroll)
         frame_conn.grid(row=0, column=0, sticky="ew", **pad)
         frame_conn.grid_columnconfigure(1, weight=1)
 
@@ -507,23 +1044,63 @@ class App(ctk.CTk):
             row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4)
         )
 
-        ctk.CTkLabel(frame_conn, text="Email:").grid(row=1, column=0, sticky="w", padx=(10, 4), pady=2)
+        ctk.CTkLabel(frame_conn, text="Callibri Email:").grid(row=1, column=0, sticky="w", padx=(10, 4), pady=2)
         self.entry_email = ctk.CTkEntry(frame_conn, width=300)
         self.entry_email.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
 
-        ctk.CTkLabel(frame_conn, text="Token:").grid(row=2, column=0, sticky="w", padx=(10, 4), pady=2)
+        ctk.CTkLabel(frame_conn, text="Callibri Token:").grid(row=2, column=0, sticky="w", padx=(10, 4), pady=2)
         self.entry_token = ctk.CTkEntry(frame_conn, width=300, show="*")
         self.entry_token.grid(row=2, column=1, sticky="ew", padx=4, pady=2)
 
         self.btn_check = ctk.CTkButton(frame_conn, text="Проверить", width=120, command=self._on_check_connection)
         self.btn_check.grid(row=1, column=2, rowspan=2, padx=(4, 10), pady=2)
 
+        ctk.CTkLabel(frame_conn, text="Calltouch API ID:").grid(row=3, column=0, sticky="w", padx=(10, 4), pady=2)
+        self.entry_calltouch = ctk.CTkEntry(frame_conn, width=300, show="*", placeholder_text="clientApiId")
+        self.entry_calltouch.grid(row=3, column=1, sticky="ew", padx=4, pady=2)
+
+        self.btn_check_calltouch = ctk.CTkButton(
+            frame_conn, text="Проверить CT", width=120,
+            command=self._on_check_calltouch,
+        )
+        self.btn_check_calltouch.grid(row=3, column=2, padx=(4, 10), pady=2)
+
         self.lbl_conn_status = ctk.CTkLabel(frame_conn, text="", text_color="gray")
-        self.lbl_conn_status.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+        self.lbl_conn_status.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
+        # --- Google Sheets ---
+        frame_gsheet = ctk.CTkFrame(scroll)
+        frame_gsheet.grid(row=1, column=0, sticky="ew", **pad)
+        frame_gsheet.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(frame_gsheet, text="Google Sheets", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4)
+        )
+
+        ctk.CTkLabel(frame_gsheet, text="Credentials:").grid(row=1, column=0, sticky="w", padx=(10, 4), pady=2)
+        self.entry_gsheet_creds = ctk.CTkEntry(frame_gsheet, width=300, placeholder_text="credentials.json")
+        self.entry_gsheet_creds.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+
+        btn_frame_gs = ctk.CTkFrame(frame_gsheet, fg_color="transparent")
+        btn_frame_gs.grid(row=1, column=2, padx=(4, 10), pady=2)
+
+        ctk.CTkButton(
+            btn_frame_gs, text="...", width=36,
+            command=self._on_browse_credentials,
+        ).pack(side="left", padx=(0, 4))
+
+        self.btn_check_gsheet = ctk.CTkButton(
+            btn_frame_gs, text="Проверить", width=90,
+            command=self._on_check_gsheet,
+        )
+        self.btn_check_gsheet.pack(side="left")
+
+        self.lbl_gsheet_status = ctk.CTkLabel(frame_gsheet, text="Не настроено", text_color="gray")
+        self.lbl_gsheet_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
         # --- Период ---
-        frame_period = ctk.CTkFrame(self)
-        frame_period.grid(row=1, column=0, sticky="ew", **pad)
+        frame_period = ctk.CTkFrame(scroll)
+        frame_period.grid(row=2, column=0, sticky="ew", **pad)
 
         ctk.CTkLabel(frame_period, text="Период", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 4)
@@ -532,10 +1109,20 @@ class App(ctk.CTk):
         ctk.CTkLabel(frame_period, text="С:").grid(row=1, column=0, sticky="w", padx=(10, 4), pady=2)
         self.entry_date1 = ctk.CTkEntry(frame_period, width=120, placeholder_text="dd.mm.yyyy")
         self.entry_date1.grid(row=1, column=1, padx=4, pady=2)
+        ctk.CTkButton(
+            frame_period, text="📅", width=32, height=28,
+            fg_color="transparent", border_width=1, text_color=("gray10", "gray90"),
+            command=lambda: self._pick_date(self.entry_date1),
+        ).grid(row=1, column=2, padx=(0, 8), pady=2)
 
-        ctk.CTkLabel(frame_period, text="По:").grid(row=1, column=2, sticky="w", padx=(12, 4), pady=2)
+        ctk.CTkLabel(frame_period, text="По:").grid(row=1, column=3, sticky="w", padx=(12, 4), pady=2)
         self.entry_date2 = ctk.CTkEntry(frame_period, width=120, placeholder_text="dd.mm.yyyy")
-        self.entry_date2.grid(row=1, column=3, padx=4, pady=2)
+        self.entry_date2.grid(row=1, column=4, padx=4, pady=2)
+        ctk.CTkButton(
+            frame_period, text="📅", width=32, height=28,
+            fg_color="transparent", border_width=1, text_color=("gray10", "gray90"),
+            command=lambda: self._pick_date(self.entry_date2),
+        ).grid(row=1, column=5, padx=(0, 8), pady=2)
 
         btn_frame = ctk.CTkFrame(frame_period, fg_color="transparent")
         btn_frame.grid(row=2, column=0, columnspan=6, sticky="w", padx=10, pady=(4, 8))
@@ -550,8 +1137,8 @@ class App(ctk.CTk):
         self._set_quick_period(7)
 
         # --- Проекты ---
-        frame_projects = ctk.CTkFrame(self)
-        frame_projects.grid(row=2, column=0, sticky="ew", **pad)
+        frame_projects = ctk.CTkFrame(scroll)
+        frame_projects.grid(row=3, column=0, sticky="ew", **pad)
         frame_projects.grid_columnconfigure(0, weight=1)
 
         projects_header = ctk.CTkFrame(frame_projects, fg_color="transparent")
@@ -571,8 +1158,8 @@ class App(ctk.CTk):
         self.projects_scroll.grid_columnconfigure(0, weight=1)
 
         # --- Прогресс ---
-        frame_progress = ctk.CTkFrame(self)
-        frame_progress.grid(row=3, column=0, sticky="ew", **pad)
+        frame_progress = ctk.CTkFrame(scroll)
+        frame_progress.grid(row=4, column=0, sticky="ew", **pad)
         frame_progress.grid_columnconfigure(0, weight=1)
 
         self.progress_bar = ctk.CTkProgressBar(frame_progress)
@@ -583,10 +1170,9 @@ class App(ctk.CTk):
         self.lbl_progress.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
 
         # --- Лог ---
-        frame_log = ctk.CTkFrame(self)
-        frame_log.grid(row=4, column=0, sticky="nsew", **pad)
+        frame_log = ctk.CTkFrame(scroll)
+        frame_log.grid(row=5, column=0, sticky="ew", **pad)
         frame_log.grid_columnconfigure(0, weight=1)
-        frame_log.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(frame_log, text="Лог", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=10, pady=(8, 4)
@@ -596,9 +1182,9 @@ class App(ctk.CTk):
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
         self.log_box.configure(state="disabled")
 
-        # --- Кнопки ---
+        # --- Кнопки (всегда видны, вне скролла) ---
         frame_buttons = ctk.CTkFrame(self, fg_color="transparent")
-        frame_buttons.grid(row=5, column=0, sticky="ew", padx=12, pady=(6, 12))
+        frame_buttons.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 12))
 
         self.btn_export = ctk.CTkButton(
             frame_buttons, text="Экспорт", width=160, height=38,
@@ -622,16 +1208,63 @@ class App(ctk.CTk):
             load_dotenv(env_path, override=True)
         email = os.getenv("CALLIBRI_EMAIL", "")
         token = os.getenv("CALLIBRI_TOKEN", "")
+        calltouch_id = os.getenv("CALLTOUCH_API_ID", "")
+        gsheet_creds = os.getenv("GSHEET_CREDENTIALS", "")
         if email:
             self.entry_email.insert(0, email)
         if token:
             self.entry_token.insert(0, token)
+        if calltouch_id:
+            self.entry_calltouch.insert(0, calltouch_id)
+        if gsheet_creds:
+            self.entry_gsheet_creds.insert(0, gsheet_creds)
+            self._gsheet_credentials_path = gsheet_creds
 
     def _save_env(self):
         env_path = os.path.join(core.get_app_dir(), ".env")
         with open(env_path, "w", encoding="utf-8") as f:
             f.write(f"CALLIBRI_EMAIL={self.entry_email.get()}\n")
             f.write(f"CALLIBRI_TOKEN={self.entry_token.get()}\n")
+            ct_id = self.entry_calltouch.get().strip()
+            if ct_id:
+                f.write(f"CALLTOUCH_API_ID={ct_id}\n")
+            gsheet_creds = self.entry_gsheet_creds.get().strip()
+            if gsheet_creds:
+                f.write(f"GSHEET_CREDENTIALS={gsheet_creds}\n")
+
+    # ── Google Sheets подключение ────────────────────────────────────────
+
+    def _on_browse_credentials(self):
+        path = filedialog.askopenfilename(
+            title="Выберите credentials.json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if path:
+            self.entry_gsheet_creds.delete(0, "end")
+            self.entry_gsheet_creds.insert(0, path)
+            self._gsheet_credentials_path = path
+
+    def _on_check_gsheet(self):
+        creds_path = self.entry_gsheet_creds.get().strip()
+        if not creds_path:
+            self.lbl_gsheet_status.configure(text="Укажите путь к credentials.json", text_color="orange")
+            return
+
+        if not HAS_GSHEETS:
+            self.lbl_gsheet_status.configure(
+                text="Пакеты не установлены: pip install gspread google-auth",
+                text_color="red",
+            )
+            return
+
+        self.btn_check_gsheet.configure(state="disabled", text="Проверяем...")
+        self._gsheet_credentials_path = creds_path
+
+        def _check():
+            ok, sa_email, msg = gs.test_gsheet_connection(creds_path)
+            self.msg_queue.put(("gsheet_conn_result", ok, msg))
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def _load_projects(self):
         for widget in self.projects_scroll.winfo_children():
@@ -650,6 +1283,7 @@ class App(ctk.CTk):
 
     def _add_project_row(self, idx, proj):
         """Создаёт одну строку проекта в списке."""
+        provider_name = proj.get("provider", "callibri")
         site_id = proj.get("site_id")
         folder = proj.get("folder", "")
         enabled = proj.get("enabled", True)
@@ -661,13 +1295,19 @@ class App(ctk.CTk):
         row_frame.pack(fill="x", pady=1)
         row_frame.grid_columnconfigure(1, weight=1)
 
+        gsheet = proj.get("gsheet")
+
         var = ctk.IntVar(value=1 if enabled else 0)
-        label = f"{folder} ({site_id})"
+        label = f"[{provider_name}] {folder} ({site_id})"
         if channels:
             label += f" — {', '.join(channels)}"
         label += f" | {fmt}"
         if fields:
             label += f" | {len(fields)} полей"
+        if not proj.get("file_export", True):
+            label += " | без файла"
+        if gsheet and gsheet.get("enabled"):
+            label += " | GSheets"
 
         cb = ctk.CTkCheckBox(row_frame, text=label, variable=var)
         cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=4)
@@ -689,6 +1329,7 @@ class App(ctk.CTk):
         btn_remove.grid(row=0, column=3, padx=(2, 4))
 
         self._project_widgets.append({
+            "provider": provider_name,
             "site_id": site_id,
             "var": var,
             "frame": row_frame,
@@ -700,10 +1341,17 @@ class App(ctk.CTk):
         if idx >= len(self._projects_config):
             return
         proj = self._projects_config[idx]
-        email = self.entry_email.get().strip()
-        token = self.entry_token.get().strip()
+        try:
+            provider = core.get_project_provider(proj)
+        except ValueError as e:
+            self._append_log(f"ОШИБКА: {e}")
+            return
+        creds = self._get_creds(provider)
+        gsheet_creds = self._gsheet_credentials_path
 
-        dialog = ProjectSettingsDialog(self, proj, email, token)
+        dialog = ProjectSettingsDialog(
+            self, proj, provider, creds, gsheet_credentials=gsheet_creds,
+        )
         self.wait_window(dialog)
 
         if dialog.result is not None:
@@ -717,6 +1365,13 @@ class App(ctk.CTk):
 
             proj["format"] = r["format"]
             proj["split_by_channel"] = r["split_by_channel"]
+            proj["file_export"] = r.get("file_export", True)
+
+            # Google Sheets
+            if r.get("gsheet") is not None:
+                proj["gsheet"] = r["gsheet"]
+            elif "gsheet" in proj:
+                del proj["gsheet"]
 
             # Сохраняем и обновляем UI
             core.save_projects(self._projects_config)
@@ -738,46 +1393,82 @@ class App(ctk.CTk):
     # ── Добавление проекта ────────────────────────────────────────────────
 
     def _on_add_project(self):
-        email = self.entry_email.get().strip()
-        token = self.entry_token.get().strip()
+        # Запрос провайдера у пользователя (если их > 1)
+        avail = providers.provider_names()
+        if len(avail) == 1:
+            provider_name = avail[0]
+        else:
+            dialog = ProviderChoiceDialog(self, avail)
+            self.wait_window(dialog)
+            if not dialog.result:
+                return
+            provider_name = dialog.result
 
-        if not email or not token:
-            self._append_log("Заполни email и token для загрузки списка проектов")
+        provider = providers.get_provider(provider_name)
+        creds = self._get_creds(provider)
+        ok, msg = provider.check_credentials(creds)
+        if not ok:
+            self._append_log(f"Заполни учётные данные {provider.LABEL}: {msg}")
             return
 
-        # Загрузка списка проектов из API (с кэшем)
-        if self._api_sites is None:
-            self._append_log("Загружаем проекты из API...")
-            self.btn_add_project.configure(state="disabled")
+        # Если у провайдера нет публичного /sites API — диалог ручного ввода
+        if getattr(provider, "REQUIRES_MANUAL_SITE_ID", False):
+            self._show_manual_add_dialog(provider.NAME)
+            return
 
-            def _fetch():
-                try:
-                    sites = core.get_sites(email, token)
-                    self.msg_queue.put(("sites_loaded", sites))
-                except Exception as e:
-                    self.msg_queue.put(("log", f"Ошибка загрузки проектов: {e}"))
-                    self.msg_queue.put(("sites_loaded", None))
+        self._append_log(f"Загружаем проекты из API [{provider.LABEL}]...")
+        self.btn_add_project.configure(state="disabled")
 
-            threading.Thread(target=_fetch, daemon=True).start()
-        else:
-            self._show_add_dialog(self._api_sites)
+        def _fetch():
+            try:
+                sites = provider.list_sites(creds)
+                self.msg_queue.put(("sites_loaded", provider.NAME, sites))
+            except Exception as e:
+                self.msg_queue.put(("log", f"Ошибка загрузки проектов [{provider.LABEL}]: {e}"))
+                self.msg_queue.put(("sites_loaded", provider.NAME, None))
 
-    def _show_add_dialog(self, sites):
-        existing = {p.get("site_id") for p in self._projects_config}
-        dialog = AddProjectDialog(self, sites, existing)
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _show_manual_add_dialog(self, provider_name):
+        """Диалог ручного ввода siteId (для провайдеров без /sites API)."""
+        existing = {
+            (p.get("provider", "callibri"), p.get("site_id"))
+            for p in self._projects_config
+        }
+        dialog = ManualAddProjectDialog(self, provider_name, existing)
         self.wait_window(dialog)
 
         if dialog.result is not None:
-            # Проверяем дубликат
+            key = (dialog.result["provider"], dialog.result["site_id"])
+            if key in existing:
+                self._append_log(f"Проект [{key[0]}] site_id={key[1]} уже есть в конфиге")
+                return
+            self._projects_config.append(dialog.result)
+            core.save_projects(self._projects_config)
+            self._load_projects()
+            self._append_log(
+                f"Добавлен проект [{key[0]}]: {dialog.result['folder']} ({key[1]})"
+            )
+
+    def _show_add_dialog(self, sites, provider_name="callibri"):
+        existing = {
+            (p.get("provider", "callibri"), p.get("site_id"))
+            for p in self._projects_config
+        }
+        dialog = AddProjectDialog(self, sites, existing, provider_name)
+        self.wait_window(dialog)
+
+        if dialog.result is not None:
             new_sid = dialog.result["site_id"]
-            if any(p.get("site_id") == new_sid for p in self._projects_config):
-                self._append_log(f"Проект site_id={new_sid} уже есть в конфиге")
+            key = (dialog.result.get("provider", "callibri"), new_sid)
+            if key in existing:
+                self._append_log(f"Проект [{key[0]}] site_id={new_sid} уже есть в конфиге")
                 return
 
             self._projects_config.append(dialog.result)
             core.save_projects(self._projects_config)
             self._load_projects()
-            self._append_log(f"Добавлен проект: {dialog.result['folder']} ({new_sid})")
+            self._append_log(f"Добавлен проект [{key[0]}]: {dialog.result['folder']} ({new_sid})")
 
     # ── Быстрый выбор периода ─────────────────────────────────────────────
 
@@ -789,19 +1480,51 @@ class App(ctk.CTk):
         self.entry_date2.delete(0, "end")
         self.entry_date2.insert(0, date2.strftime("%d.%m.%Y"))
 
+    def _pick_date(self, entry):
+        current_value = entry.get().strip()
+        initial = None
+        if current_value:
+            try:
+                initial = datetime.strptime(current_value, "%d.%m.%Y")
+            except ValueError:
+                initial = None
+
+        def _on_select(picked):
+            entry.delete(0, "end")
+            entry.insert(0, picked.strftime("%d.%m.%Y"))
+
+        DatePickerDialog(self, initial_date=initial, on_select=_on_select)
+
     # ── Проверка соединения ───────────────────────────────────────────────
 
     def _on_check_connection(self):
         self.btn_check.configure(state="disabled", text="Проверяем...")
         self.lbl_conn_status.configure(text="", text_color="gray")
         self._api_sites = None  # сбрасываем кэш
+        self._save_env()
 
-        email = self.entry_email.get().strip()
-        token = self.entry_token.get().strip()
+        provider = providers.get_provider("callibri")
+        creds = self._get_creds(provider)
 
         def _check():
-            ok, count, msg = core.test_connection(email, token)
+            ok, count, msg = provider.test_connection(creds)
             self.msg_queue.put(("conn_result", ok, msg))
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_check_calltouch(self):
+        """Проверка подключения к Calltouch API."""
+        self.btn_check_calltouch.configure(state="disabled", text="Проверяем...")
+        self._api_sites = None
+        # Сразу сохраняем токен в .env, чтобы он не терялся между запусками
+        self._save_env()
+
+        provider = providers.get_provider("calltouch")
+        creds = self._get_creds(provider)
+
+        def _check():
+            ok, count, msg = provider.test_connection(creds)
+            self.msg_queue.put(("conn_result", ok, f"[Calltouch] {msg}"))
 
         threading.Thread(target=_check, daemon=True).start()
 
@@ -817,15 +1540,12 @@ class App(ctk.CTk):
             self._append_log(f"ОШИБКА: {e}")
             return
 
-        email = self.entry_email.get().strip()
-        token = self.entry_token.get().strip()
-
-        enabled_ids = set()
+        enabled_keys = set()
         for pw in self._project_widgets:
             if pw["var"].get():
-                enabled_ids.add(pw["site_id"])
+                enabled_keys.add((pw["provider"], pw["site_id"]))
 
-        if not enabled_ids:
+        if not enabled_keys:
             self._append_log("Нет выбранных проектов для экспорта")
             return
 
@@ -837,18 +1557,44 @@ class App(ctk.CTk):
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
+        self._write_log_file(f"{'=' * 60}\n=== Старт экспорта {date1_str} — {date2_str} ===")
+
+        gsheet_creds = self._gsheet_credentials_path if self._gsheet_credentials_path else None
+        credentials = self._all_credentials()
 
         params = dict(
-            email=email,
-            token=token,
+            credentials=credentials,
             date1_str=date1_str,
             date2_str=date2_str,
-            enabled_site_ids=enabled_ids,
+            enabled_keys=enabled_keys,
             on_log=lambda m: self.msg_queue.put(("log", m)),
             on_progress=lambda pi, pt, ci, ct: self.msg_queue.put(("progress", pi, pt, ci, ct)),
+            gsheet_credentials=gsheet_creds,
         )
 
         threading.Thread(target=self._run_export, args=(params,), daemon=True).start()
+
+    # ── Учётные данные ────────────────────────────────────────────────────
+
+    def _get_creds(self, provider):
+        """Собрать creds dict для конкретного провайдера из UI."""
+        if provider.NAME == "callibri":
+            return {
+                "email": self.entry_email.get().strip(),
+                "token": self.entry_token.get().strip(),
+            }
+        if provider.NAME == "calltouch":
+            return {
+                "client_api_id": self.entry_calltouch.get().strip(),
+            }
+        return {}
+
+    def _all_credentials(self):
+        """Полный dict учётных данных для run_export."""
+        creds = {}
+        for prov in providers.all_providers():
+            creds[prov.NAME] = self._get_creds(prov)
+        return creds
 
     def _run_export(self, params):
         try:
@@ -906,17 +1652,26 @@ class App(ctk.CTk):
             elif kind == "conn_result":
                 _, ok, message = msg
                 self.btn_check.configure(state="normal", text="Проверить")
+                self.btn_check_calltouch.configure(state="normal", text="Проверить CT")
                 self.lbl_conn_status.configure(
                     text=message,
                     text_color="green" if ok else "red",
                 )
 
+            elif kind == "gsheet_conn_result":
+                _, ok, message = msg
+                self.btn_check_gsheet.configure(state="normal", text="Проверить")
+                self.lbl_gsheet_status.configure(
+                    text=message,
+                    text_color="green" if ok else "red",
+                )
+
             elif kind == "sites_loaded":
-                sites = msg[1]
+                _, provider_name, sites = msg
                 self.btn_add_project.configure(state="normal")
                 if sites is not None:
                     self._api_sites = sites
-                    self._show_add_dialog(sites)
+                    self._show_add_dialog(sites, provider_name)
 
         self.after(100, self._poll_queue)
 
@@ -927,6 +1682,17 @@ class App(ctk.CTk):
         self.log_box.insert("end", text + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        self._write_log_file(text)
+
+    def _write_log_file(self, text):
+        try:
+            log_path = os.path.join(core.get_app_dir(), "output", "export.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{stamp}  {text}\n")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
