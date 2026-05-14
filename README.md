@@ -1,4 +1,4 @@
-# Callibri Export
+# Callibri / Calltouch Export
 
 GUI + CLI приложение для выгрузки обращений (звонки, заявки, чаты, email-обращения) из **Callibri** и **Calltouch** в XLSX / CSV / Google Sheets.
 
