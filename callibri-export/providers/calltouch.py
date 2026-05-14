@@ -5,18 +5,25 @@ API-специфика:
 - Базовый URL: https://api.calltouch.ru
 - Авторизация: query-параметр clientApiId (один токен на аккаунт)
 - Эндпоинт звонков:  GET /calls-service/RestAPI/{siteId}/calls-diary/calls
-- Эндпоинт сделок (универсальный журнал):
+  Формат даты dd/mm/yyyy, пагинация page+limit, ответ {records,...}
+- Эндпоинт заявок (Журнал заявок):
+                     GET /calls-service/RestAPI/requests?siteId=...
+  Формат даты mm/dd/yyyy (отличается!), siteId в query, ответ — голый массив.
+  Документация: https://www.calltouch.ru/support/vygruzka-zhurnala-zayavok-cherez-api/
+- Эндпоинт сделок (журнал сделок CRM):
                      GET /calls-service/RestAPI/{siteId}/orders-diary/orders
   Поддерживает фильтр orderSource=CALL|REQUEST|CHAT. Используется для
-  заявок и чатов (для звонков оставлен calls-diary как более богатый).
+  чатов. Для заявок НЕ используется — там лежат только сделки CRM, и заявки
+  попадают туда лишь при настроенной интеграции (например, через amoCRM).
   Документация: https://www.calltouch.ru/support/api-metod-vygruzki-zhurnala-sdelok/
-- Эндпоинт сайтов:   GET /sites-service/sites (список доступных siteId аккаунта)
-- Формат даты: dd/mm/yyyy (dateFrom / dateTo)
-- Пагинация: page (>=1), limit (<=1000). Ответ содержит records[] + recordsCount + pageTotal
+- Эндпоинт сайтов:   GET /sites-service/sites (публично не работает)
+- Пагинация: page (>=1), limit (<=1000)
 - Макс период за один запрос: 3 месяца
 
 Доп. параметры для звонков (включены по умолчанию):
   withCallTags=true, withYandexDirect=true, withAttributionFields=true
+Для журнала заявок:
+  withMapVisits=true, withRequestTags=true, withCustomFields=true
 Для orders-diary:
   withOrdersTags=true, withComments=true, withContacts=true
 
@@ -198,6 +205,32 @@ def _record_date_key(record):
     return ""
 
 
+def _format_tags(tags):
+    """Нормализовать поле тегов Calltouch в строку через запятую.
+
+    Calltouch отдаёт теги как список dict-ов вида
+    {"category": "", "type": "MANUAL", "names": ["Лид Самара"]}.
+    Имя тега — в поле "names" (список строк), а не "name".
+    """
+    if not isinstance(tags, list):
+        return str(tags) if tags else ""
+    parts = []
+    for t in tags:
+        if isinstance(t, dict):
+            names = t.get("names")
+            if isinstance(names, list):
+                parts.extend(str(n) for n in names if n)
+            elif names:
+                parts.append(str(names))
+            else:
+                name = t.get("name")
+                if name:
+                    parts.append(str(name))
+        elif t:
+            parts.append(str(t))
+    return ", ".join(parts)
+
+
 # ── Извлечение полей ─────────────────────────────────────────────────────────
 
 def _utm(record):
@@ -229,12 +262,9 @@ def _utm(record):
 def _build_row_calls(record, columns):
     """Строка для звонка."""
     utm = _utm(record)
-    tags = record.get("tags") or record.get("callTags") or []
-    if isinstance(tags, list):
-        tag_names = [t.get("name") if isinstance(t, dict) else str(t) for t in tags]
-        tags_str = ", ".join(t for t in tag_names if t)
-    else:
-        tags_str = str(tags) if tags else ""
+    tags_str = _format_tags(
+        record.get("callTags") or record.get("tags") or record.get("additionalTags")
+    )
 
     base = {
         "id": str(record.get("callId") or record.get("id") or ""),
@@ -305,12 +335,7 @@ def _build_row_orders(record, columns, row_type="requests"):
     yandex_direct = visit.get("yandexDirect") or {}
     google_ads = visit.get("googleAdWords") or {}
 
-    tags = record.get("tags") or []
-    if isinstance(tags, list):
-        tag_names = [t.get("name") if isinstance(t, dict) else str(t) for t in tags]
-        tags_str = ", ".join(n for n in tag_names if n)
-    else:
-        tags_str = str(tags) if tags else ""
+    tags_str = _format_tags(record.get("tags"))
 
     # Телефон и email могут приходить и плоско, и внутри client
     phone = (_first(client.get("phones"))
@@ -387,6 +412,108 @@ def _build_row_orders(record, columns, row_type="requests"):
         "completed_amount": record.get("completedAmount") or "",
         "funnel": record.get("funnel") or "",
         "service": record.get("service") or "",
+    }
+    return {col: base.get(col, "") for col in columns}
+
+
+def _build_row_requests(record, columns):
+    """Строка из записи журнала заявок Calltouch.
+
+    Структура отличается от orders-diary: requestId вместо orderId,
+    session.* вместо visit.*, client.phones — список dict с phoneNumber.
+    Документация: https://www.calltouch.ru/support/vygruzka-zhurnala-zayavok-cherez-api/
+    """
+    session = record.get("session") or {}
+    client = record.get("client") or {}
+    yandex_direct = record.get("yandexDirect") or {}
+    google_ads = record.get("googleAdWords") or {}
+
+    tags_str = _format_tags(
+        record.get("RequestTags") or record.get("requestTags") or record.get("tags")
+    )
+
+    phone = ""
+    phones = client.get("phones")
+    if isinstance(phones, list) and phones:
+        first = phones[0]
+        if isinstance(first, dict):
+            phone = first.get("phoneNumber") or first.get("value") or ""
+        else:
+            phone = str(first)
+    elif isinstance(phones, str):
+        phone = phones
+
+    email = ""
+    contacts = client.get("contacts")
+    if isinstance(contacts, list):
+        for c in contacts:
+            if isinstance(c, dict) and (c.get("type") or "").lower() == "email":
+                email = c.get("value") or ""
+                if email:
+                    break
+    if not email:
+        email = client.get("email") or ""
+
+    fio = client.get("fio") or ""
+
+    manager = record.get("manager") or ""
+    if isinstance(manager, dict):
+        manager = manager.get("name") or manager.get("fio") or ""
+
+    comments = record.get("comments") or []
+    if isinstance(comments, list):
+        parts = []
+        for c in comments:
+            if isinstance(c, dict):
+                parts.append(c.get("text") or c.get("comment") or "")
+            else:
+                parts.append(str(c))
+        comment = " | ".join(p for p in parts if p)
+    else:
+        comment = str(comments) if comments else ""
+
+    base = {
+        "id": str(record.get("requestId") or record.get("requestNumber") or ""),
+        "date": _format_date(record.get("dateStr")),
+        "type": "requests",
+        "phone_number": str(phone) if phone else "",
+        "client_name": fio,
+        "client_email": str(email) if email else "",
+        "source": session.get("utmSource") or session.get("source") or "",
+        "medium": session.get("utmMedium") or session.get("medium") or "",
+        "utm_campaign": session.get("utmCampaign") or "",
+        "utm_content": session.get("utmContent") or "",
+        "utm_term": session.get("utmTerm") or "",
+        "keyword": (session.get("keywords") or session.get("keyword")
+                    or yandex_direct.get("keyword") or google_ads.get("keyword") or ""),
+        "city": session.get("city") or "",
+        "ref": session.get("ref") or session.get("referrer") or "",
+        "url": session.get("url") or record.get("requestUrl") or "",
+        "status": record.get("status") or "",
+        "tags": tags_str,
+        "attribution": session.get("attribution") or "",
+        "unique_call": "",
+        "target_call": record.get("targetRequest", ""),
+        "ya_client_id": session.get("yaClientId") or "",
+        "ga_client_id": session.get("guaClientId") or session.get("gaClientId") or "",
+        "site_id": record.get("siteId") or "",
+        "duration": "",
+        "waiting_connect": "",
+        "call_url": "",
+        "manager": str(manager),
+        "form_name": record.get("subject") or "",
+        "comment": comment,
+        "order_number": str(record.get("requestNumber") or ""),
+        "order_name": record.get("subject") or "",
+        "order_status": record.get("status") or "",
+        "request_type": record.get("requestType") or "REQUEST",
+        "session_id": session.get("sessionId") or "",
+        "created_date": _format_date(record.get("dateStr")),
+        "updated_date": "",
+        "planned_amount": "",
+        "completed_amount": "",
+        "funnel": "",
+        "service": "",
     }
     return {col: base.get(col, "") for col in columns}
 
@@ -540,7 +667,8 @@ def test_connection(creds):
 
 def _fetch_paginated(endpoint_path, site_id, date1, date2, creds,
                      extra_params=None, on_log=None, label=""):
-    """Генератор записей через пагинацию page+limit."""
+    """Генератор записей через пагинацию page+limit (calls-diary, orders-diary).
+    Формат даты: dd/mm/yyyy."""
     url = f"{BASE_URL}{endpoint_path}"
     params = {
         **_auth_params(creds),
@@ -568,6 +696,44 @@ def _fetch_paginated(endpoint_path, site_id, date1, date2, creds,
             yield r
 
         if not records or not has_more:
+            break
+
+        page += 1
+        time.sleep(0.3)
+
+
+def _fetch_requests_paginated(site_id, date1, date2, creds,
+                              extra_params=None, on_log=None, label=""):
+    """Генератор записей журнала заявок Calltouch.
+
+    Эндпоинт без siteId в пути, siteId — query-параметр. Формат даты mm/dd/yyyy
+    (не dd/mm/yyyy как у calls-diary). Ответ — голый массив без обёртки records.
+    """
+    url = f"{BASE_URL}/calls-service/RestAPI/requests"
+    params = {
+        **_auth_params(creds),
+        "siteId": site_id,
+        "dateFrom": date1.strftime("%m/%d/%Y"),
+        "dateTo": date2.strftime("%m/%d/%Y"),
+        "limit": PAGE_LIMIT,
+    }
+    if extra_params:
+        params.update(extra_params)
+
+    page = 1
+    while True:
+        params["page"] = page
+        data = _request_with_retry(url, params, on_log, f"{label} page={page}")
+
+        if isinstance(data, list):
+            records = data
+        else:
+            records = data.get("records") or data.get("items") or data.get("data") or []
+
+        for r in records:
+            yield r
+
+        if not records or len(records) < PAGE_LIMIT:
             break
 
         page += 1
@@ -603,7 +769,7 @@ def get_channels_and_statuses(site_id, creds):
     except (requests.RequestException, ConnectionError):
         pass
 
-    # Сделки (заявки + чаты) — только источники/статусы, без фильтра по типу
+    # Сделки (чаты) — только источники/статусы
     try:
         for rec in _fetch_paginated(
             f"/calls-service/RestAPI/{site_id}/orders-diary/orders",
@@ -615,6 +781,23 @@ def get_channels_and_statuses(site_id, creds):
             if src:
                 sources.add(str(src))
             st = rec.get("orderStatus")
+            if st:
+                statuses.add(str(st))
+    except (requests.RequestException, ConnectionError):
+        pass
+
+    # Заявки — отдельный журнал
+    try:
+        for rec in _fetch_requests_paginated(
+            site_id, date1, date2, creds,
+            extra_params={"withRequestTags": "false"},
+            label="sample requests",
+        ):
+            session = rec.get("session") or {}
+            src = session.get("utmSource") or session.get("source")
+            if src:
+                sources.add(str(src))
+            st = rec.get("status")
             if st:
                 statuses.add(str(st))
     except (requests.RequestException, ConnectionError):
@@ -637,6 +820,11 @@ def process_site(site, date1, date2, creds, filters=None, on_log=None, on_chunk=
     columns = filters.get("columns") or DEFAULT_COLUMNS
     type_filter = filters.get("types") or APPEAL_TYPES
     status_filter = filters.get("statuses")
+    medium_filter = filters.get("mediums")  # список utm_medium-значений (cpc, organic, ...)
+    medium_filter_set = (
+        {str(m).strip().lower() for m in medium_filter if str(m).strip()}
+        if medium_filter else None
+    )
 
     site_id = site.get("site_id")
     chunks = split_period(date1, date2)
@@ -652,6 +840,12 @@ def process_site(site, date1, date2, creds, filters=None, on_log=None, on_chunk=
         "withCallTags": "true",
         "withAttributionFields": "true",
         "withYandexDirect": "true",
+    }
+    # Параметры для журнала заявок.
+    requests_extra_params = {
+        "withMapVisits": "true",
+        "withRequestTags": "true",
+        "withCustomFields": "true",
     }
     # Универсальные параметры для orders-diary.
     orders_base_params = {
@@ -681,10 +875,10 @@ def process_site(site, date1, date2, creds, filters=None, on_log=None, on_chunk=
         if "requests" in type_filter:
             endpoints.append((
                 "requests",
-                orders_path,
-                lambda r, c: _build_row_orders(r, c, row_type="requests"),
-                {**orders_base_params, "orderSource": "REQUEST"},
-                "orders",
+                None,  # путь зашит в _fetch_requests_paginated
+                _build_row_requests,
+                requests_extra_params,
+                "requests",
             ))
         if "chats" in type_filter:
             endpoints.append((
@@ -698,19 +892,29 @@ def process_site(site, date1, date2, creds, filters=None, on_log=None, on_chunk=
         for atype, path, builder, extra, shape in endpoints:
             endpoints_total += 1
             try:
-                records_iter = list(_fetch_paginated(
-                    path, site_id, chunk_start, chunk_end, creds,
-                    extra_params=extra,
-                    on_log=on_log,
-                    label=f"{atype} чанк {idx}/{total_chunks}",
-                ))
+                if shape == "requests":
+                    records_iter = list(_fetch_requests_paginated(
+                        site_id, chunk_start, chunk_end, creds,
+                        extra_params=extra,
+                        on_log=on_log,
+                        label=f"{atype} чанк {idx}/{total_chunks}",
+                    ))
+                else:
+                    records_iter = list(_fetch_paginated(
+                        path, site_id, chunk_start, chunk_end, creds,
+                        extra_params=extra,
+                        on_log=on_log,
+                        label=f"{atype} чанк {idx}/{total_chunks}",
+                    ))
                 endpoints_ok += 1
             except (requests.RequestException, ConnectionError) as e:
                 _emit(on_log, f"    Чанк {idx}/{total_chunks} [{atype}] ({d1}—{d2}): пропущен — {_redact(e)}")
                 continue
 
             for record in records_iter:
-                if shape == "orders":
+                if shape == "requests":
+                    rid = str(record.get("requestId") or record.get("requestNumber") or "")
+                elif shape == "orders":
                     rid = str(record.get("orderId") or record.get("id") or "")
                 else:
                     rid = str(record.get("callId") or record.get("id") or "")
@@ -720,18 +924,33 @@ def process_site(site, date1, date2, creds, filters=None, on_log=None, on_chunk=
                 if dedup_key:
                     seen_ids.add(dedup_key)
 
-                if shape == "orders":
+                if shape == "requests":
+                    status_val = record.get("status") or ""
+                    session = record.get("session") or {}
+                    src = (session.get("utmSource") or session.get("source")
+                           or "Без источника")
+                    medium_val = (session.get("utmMedium")
+                                  or session.get("medium") or "")
+                elif shape == "orders":
                     status_val = record.get("orderStatus") or ""
                     src = _extract_order_source(record) or "Без источника"
+                    visit = record.get("visit") or {}
+                    medium_val = visit.get("utmMedium") or visit.get("medium") or ""
                 else:
                     status_val = record.get("callStatus") or record.get("status") or ""
                     src = (record.get("source")
                            or ((record.get("attributionSources") or [{}])[0] or {}).get("source")
                            or "Без источника")
+                    attrs = record.get("attributionSources") or [{}]
+                    medium_val = (record.get("medium") or record.get("utmMedium")
+                                  or (attrs[0] or {}).get("medium")
+                                  or (attrs[0] or {}).get("utmMedium") or "")
 
                 if status_filter and status_val not in status_filter:
                     continue
                 if channel_filter and str(src) not in channel_filter:
+                    continue
+                if medium_filter_set and str(medium_val).strip().lower() not in medium_filter_set:
                     continue
 
                 row = builder(record, columns)

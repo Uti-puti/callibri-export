@@ -1,0 +1,22 @@
+# IDE / editor data
+.claude/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Local data (per-deployment)
+.env
+projects.json
+accounts.json
+credentials.json
+output/

@@ -18,6 +18,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 import providers
+import accounts as accounts_mod
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +195,7 @@ def run_export(
     on_log=None,
     on_progress=None,
     gsheet_credentials=None,
+    accounts=None,
 ):
     """
     Главная функция экспорта.
@@ -209,10 +211,15 @@ def run_export(
       on_log(msg) — callback логов
       on_progress(project_idx, total_projects, chunk_idx, total_chunks) — прогресс
       gsheet_credentials — путь к credentials.json для Google Sheets
+      accounts — dict {provider_name: [{name, ...creds}]} именованных аккаунтов.
+                 Если у проекта задан proj["account"] — берём креды отсюда,
+                 иначе — из credentials[provider_name].
 
     Бросает ValueError при ошибках валидации.
     Возвращает dict с результатами.
     """
+    if accounts is None:
+        accounts = accounts_mod.load_accounts()
     # 1. Период
     date1, date2 = resolve_period(date1_str, date2_str, days)
     _emit(on_log, f"Период: {date1.strftime('%d.%m.%Y')} — {date2.strftime('%d.%m.%Y')}")
@@ -271,7 +278,19 @@ def run_export(
             errors += 1
             continue
 
-        creds = credentials.get(provider.NAME) or {}
+        account_name = proj_conf.get("account")
+        if account_name:
+            account = accounts_mod.get_account(provider.NAME, account_name, accounts)
+            if not account:
+                _emit(on_log, (
+                    f"ОШИБКА [{provider.LABEL}]: аккаунт '{account_name}' "
+                    f"не найден в accounts.json (folder={folder})"
+                ))
+                errors += 1
+                continue
+            creds = accounts_mod.account_credentials(account)
+        else:
+            creds = credentials.get(provider.NAME) or {}
         ok, msg = provider.check_credentials(creds)
         if not ok:
             _emit(on_log, f"ОШИБКА [{provider.LABEL}]: {msg} (folder={folder})")
@@ -328,6 +347,7 @@ def run_export(
             "columns": columns,
             "types": type_filter,
             "statuses": status_filter,
+            "mediums": proj_conf.get("mediums"),
         }
 
         try:

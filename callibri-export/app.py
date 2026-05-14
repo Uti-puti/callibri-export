@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 import core
 import providers
+import accounts as accounts_mod
 
 # Ленивый импорт gsheets — может отсутствовать если пакеты не установлены
 try:
@@ -427,6 +428,69 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
             self.entry_statuses.insert(0, ", ".join(current_statuses))
         row += 1
 
+        # --- Аккаунт Calltouch (для разных API-ключей) ---
+        is_calltouch = getattr(self.provider, "NAME", "") == "calltouch"
+        if is_calltouch:
+            ctk.CTkLabel(scroll, text="Аккаунт Calltouch", font=ctk.CTkFont(weight="bold")).grid(
+                row=row, column=0, pady=(12, 4), **pad
+            )
+            row += 1
+
+            ct_accounts = accounts_mod.get_provider_accounts("calltouch")
+            account_options = ["(дефолтный из .env)"] + [a["name"] for a in ct_accounts]
+            current_account = self.proj_conf.get("account") or ""
+            if current_account and current_account not in [a["name"] for a in ct_accounts]:
+                account_options.append(f"{current_account} (не найден)")
+                initial = f"{current_account} (не найден)"
+            elif current_account:
+                initial = current_account
+            else:
+                initial = account_options[0]
+
+            self._account_var = ctk.StringVar(value=initial)
+            self._account_menu = ctk.CTkOptionMenu(
+                scroll, values=account_options, variable=self._account_var, width=400,
+            )
+            self._account_menu.grid(row=row, column=0, padx=10, sticky="w", pady=2)
+            row += 1
+
+            ctk.CTkLabel(
+                scroll,
+                text="Управлять списком аккаунтов: главное окно → «Аккаунты Calltouch…»",
+                text_color=("gray50", "gray60"),
+                font=ctk.CTkFont(size=11),
+            ).grid(row=row, column=0, padx=10, sticky="w", pady=(0, 4))
+            row += 1
+        else:
+            self._account_var = None
+
+        # --- Тип трафика (utm_medium) — пока только для Calltouch ---
+        if is_calltouch:
+            ctk.CTkLabel(scroll, text="Тип трафика (utm_medium)", font=ctk.CTkFont(weight="bold")).grid(
+                row=row, column=0, pady=(12, 4), **pad
+            )
+            row += 1
+
+            current_mediums = self.proj_conf.get("mediums") or []
+            self.entry_mediums = ctk.CTkEntry(
+                scroll, width=400,
+                placeholder_text="cpc, organic (через запятую, пусто = все)",
+            )
+            self.entry_mediums.grid(row=row, column=0, padx=10, sticky="ew", pady=2)
+            if current_mediums:
+                self.entry_mediums.insert(0, ", ".join(current_mediums))
+            row += 1
+
+            ctk.CTkLabel(
+                scroll,
+                text="Частые значения: cpc (реклама), organic (поиск), referral (переходы), social, email, (none) (прямые)",
+                text_color=("gray50", "gray60"),
+                font=ctk.CTkFont(size=11),
+            ).grid(row=row, column=0, padx=10, sticky="w", pady=(0, 4))
+            row += 1
+        else:
+            self.entry_mediums = None
+
         # --- Формат ---
         ctk.CTkLabel(scroll, text="Формат выгрузки", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, pady=(12, 4), **pad
@@ -727,6 +791,29 @@ class ProjectSettingsDialog(ctk.CTkToplevel):
         else:
             self.result["statuses"] = None
 
+        # Тип трафика (utm_medium)
+        if self.entry_mediums is not None:
+            mediums_str = self.entry_mediums.get().strip()
+            if mediums_str:
+                self.result["mediums"] = [m.strip() for m in mediums_str.split(",") if m.strip()]
+            else:
+                self.result["mediums"] = None
+        else:
+            self.result["mediums"] = self.proj_conf.get("mediums")
+
+        # Аккаунт Calltouch
+        if self._account_var is not None:
+            chosen = self._account_var.get()
+            if chosen.endswith(" (не найден)"):
+                # Значение восстанавливаем из исходного проекта (имя без суффикса)
+                self.result["account"] = chosen.replace(" (не найден)", "")
+            elif chosen.startswith("(дефолтный"):
+                self.result["account"] = None
+            else:
+                self.result["account"] = chosen
+        else:
+            self.result["account"] = self.proj_conf.get("account")
+
         # Формат
         self.result["format"] = self._format_var.get()
 
@@ -997,6 +1084,116 @@ class ManualAddProjectDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+# ── Диалог управления аккаунтами Calltouch ──────────────────────────────────
+
+class CalltouchAccountsDialog(ctk.CTkToplevel):
+    """Список именованных аккаунтов Calltouch (имя + clientApiId).
+
+    Сохраняется в accounts.json через accounts_mod. На выходе — обновлённый
+    список (или None если пользователь отменил).
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Аккаунты Calltouch")
+        self.geometry("620x440")
+        self.transient(parent)
+        self.grab_set()
+
+        data = accounts_mod.load_accounts()
+        self._items = list(data.get("calltouch") or [])
+        self.result = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Имя аккаунта используется для привязки к проекту.\n"
+                "Для проектов без выбранного аккаунта используется CALLTOUCH_API_ID из .env."
+            ),
+            text_color=("gray40", "gray70"), justify="left",
+        ).grid(row=0, column=0, padx=12, pady=(12, 6), sticky="w")
+
+        self._scroll = ctk.CTkScrollableFrame(self)
+        self._scroll.grid(row=1, column=0, padx=12, pady=4, sticky="nsew")
+        self._scroll.grid_columnconfigure(1, weight=1)
+
+        self._row_widgets = []
+        for item in self._items:
+            self._add_row(item.get("name", ""), item.get("client_api_id", ""))
+
+        controls = ctk.CTkFrame(self, fg_color="transparent")
+        controls.grid(row=2, column=0, padx=12, pady=(4, 4), sticky="ew")
+        ctk.CTkButton(controls, text="+ Добавить аккаунт", width=180,
+                      command=lambda: self._add_row("", "")).pack(side="left")
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=3, column=0, padx=12, pady=(4, 12), sticky="e")
+        ctk.CTkButton(btns, text="Отмена", width=100, command=self.destroy,
+                      fg_color="gray").pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btns, text="Сохранить", width=120, command=self._on_save).pack(side="right")
+
+    def _add_row(self, name, token):
+        row_frame = ctk.CTkFrame(self._scroll, fg_color="transparent")
+        row_frame.grid_columnconfigure(1, weight=1)
+        row_frame.pack(fill="x", pady=2)
+
+        name_entry = ctk.CTkEntry(row_frame, width=160, placeholder_text="Имя")
+        if name:
+            name_entry.insert(0, name)
+        name_entry.grid(row=0, column=0, padx=(0, 4))
+
+        token_entry = ctk.CTkEntry(row_frame, show="*", placeholder_text="clientApiId")
+        if token:
+            token_entry.insert(0, token)
+        token_entry.grid(row=0, column=1, sticky="ew", padx=4)
+
+        del_btn = ctk.CTkButton(row_frame, text="✕", width=32, fg_color="firebrick")
+        del_btn.grid(row=0, column=2, padx=(4, 0))
+
+        rec = {"frame": row_frame, "name": name_entry, "token": token_entry}
+        del_btn.configure(command=lambda r=rec: self._remove_row(r))
+        self._row_widgets.append(rec)
+
+    def _remove_row(self, rec):
+        rec["frame"].destroy()
+        self._row_widgets.remove(rec)
+
+    def _on_save(self):
+        seen_names = set()
+        items = []
+        for rec in self._row_widgets:
+            name = rec["name"].get().strip()
+            token = rec["token"].get().strip()
+            if not name and not token:
+                continue
+            if not name or not token:
+                self._show_error("Каждый аккаунт должен иметь имя и токен")
+                return
+            if name in seen_names:
+                self._show_error(f"Имя '{name}' встречается дважды")
+                return
+            seen_names.add(name)
+            items.append({"name": name, "client_api_id": token})
+
+        data = accounts_mod.load_accounts()
+        if items:
+            data["calltouch"] = items
+        elif "calltouch" in data:
+            del data["calltouch"]
+        accounts_mod.save_accounts(data)
+        self.result = items
+        self.destroy()
+
+    def _show_error(self, msg):
+        if hasattr(self, "_err_label") and self._err_label.winfo_exists():
+            self._err_label.destroy()
+        self._err_label = ctk.CTkLabel(self, text=msg, text_color="red")
+        self._err_label.grid(row=4, column=0, padx=12, pady=(0, 6), sticky="w")
+
+
 # ── Главное окно ─────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
@@ -1065,8 +1262,14 @@ class App(ctk.CTk):
         )
         self.btn_check_calltouch.grid(row=3, column=2, padx=(4, 10), pady=2)
 
+        self.btn_accounts_calltouch = ctk.CTkButton(
+            frame_conn, text="Аккаунты Calltouch…", width=300,
+            command=self._on_manage_calltouch_accounts,
+        )
+        self.btn_accounts_calltouch.grid(row=4, column=1, sticky="w", padx=4, pady=(2, 6))
+
         self.lbl_conn_status = ctk.CTkLabel(frame_conn, text="", text_color="gray")
-        self.lbl_conn_status.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+        self.lbl_conn_status.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
         # --- Google Sheets ---
         frame_gsheet = ctk.CTkFrame(scroll)
@@ -1281,26 +1484,25 @@ class App(ctk.CTk):
         for i, proj in enumerate(self._projects_config):
             self._add_project_row(i, proj)
 
-    def _add_project_row(self, idx, proj):
-        """Создаёт одну строку проекта в списке."""
+    def _make_project_label(self, proj):
+        """Лейбл строки проекта: видит провайдера, folder, site_id и сводку фильтров."""
         provider_name = proj.get("provider", "callibri")
         site_id = proj.get("site_id")
         folder = proj.get("folder", "")
-        enabled = proj.get("enabled", True)
         channels = proj.get("channels")
         fmt = proj.get("format", "xlsx")
         fields = proj.get("fields")
-
-        row_frame = ctk.CTkFrame(self.projects_scroll, fg_color="transparent")
-        row_frame.pack(fill="x", pady=1)
-        row_frame.grid_columnconfigure(1, weight=1)
-
         gsheet = proj.get("gsheet")
+        account = proj.get("account")
+        mediums = proj.get("mediums")
 
-        var = ctk.IntVar(value=1 if enabled else 0)
         label = f"[{provider_name}] {folder} ({site_id})"
+        if account:
+            label += f" · acc: {account}"
         if channels:
             label += f" — {', '.join(channels)}"
+        if mediums:
+            label += f" · {'/'.join(mediums)}"
         label += f" | {fmt}"
         if fields:
             label += f" | {len(fields)} полей"
@@ -1308,8 +1510,25 @@ class App(ctk.CTk):
             label += " | без файла"
         if gsheet and gsheet.get("enabled"):
             label += " | GSheets"
+        return label
 
-        cb = ctk.CTkCheckBox(row_frame, text=label, variable=var)
+    def _add_project_row(self, idx, proj):
+        """Создаёт одну строку проекта в списке."""
+        provider_name = proj.get("provider", "callibri")
+        site_id = proj.get("site_id")
+        enabled = proj.get("enabled", True)
+
+        row_frame = ctk.CTkFrame(self.projects_scroll, fg_color="transparent")
+        row_frame.pack(fill="x", pady=1)
+        row_frame.grid_columnconfigure(1, weight=1)
+
+        var = ctk.IntVar(value=1 if enabled else 0)
+        label = self._make_project_label(proj)
+
+        cb = ctk.CTkCheckBox(
+            row_frame, text=label, variable=var,
+            command=lambda i=idx: self._on_toggle_enabled(i),
+        )
         cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=4)
 
         btn_settings = ctk.CTkButton(
@@ -1329,11 +1548,34 @@ class App(ctk.CTk):
         btn_remove.grid(row=0, column=3, padx=(2, 4))
 
         self._project_widgets.append({
+            "idx": idx,
             "provider": provider_name,
             "site_id": site_id,
             "var": var,
             "frame": row_frame,
+            "checkbox": cb,
         })
+
+    def _on_toggle_enabled(self, idx):
+        """Чекбокс рядом с проектом → пишем enabled в файл сразу.
+        Так галочки не слетают при перерисовках UI после редактирования настроек.
+        """
+        if not (0 <= idx < len(self._projects_config)):
+            return
+        for pw in self._project_widgets:
+            if pw.get("idx") == idx:
+                self._projects_config[idx]["enabled"] = bool(pw["var"].get())
+                core.save_projects(self._projects_config)
+                return
+
+    def _refresh_project_row(self, idx):
+        """Обновить лейбл одного row, не пересоздавая остальные (чекбоксы остаются)."""
+        if not (0 <= idx < len(self._projects_config)):
+            return
+        for pw in self._project_widgets:
+            if pw.get("idx") == idx:
+                pw["checkbox"].configure(text=self._make_project_label(self._projects_config[idx]))
+                return
 
     # ── Настройки проекта ─────────────────────────────────────────────────
 
@@ -1357,7 +1599,7 @@ class App(ctk.CTk):
         if dialog.result is not None:
             # Применяем изменения
             r = dialog.result
-            for key in ("fields", "types", "channels", "statuses"):
+            for key in ("fields", "types", "channels", "statuses", "mediums", "account"):
                 if r[key] is not None:
                     proj[key] = r[key]
                 elif key in proj:
@@ -1373,9 +1615,9 @@ class App(ctk.CTk):
             elif "gsheet" in proj:
                 del proj["gsheet"]
 
-            # Сохраняем и обновляем UI
+            # Сохраняем и точечно обновляем лейбл строки — чекбоксы остаются как были
             core.save_projects(self._projects_config)
-            self._load_projects()
+            self._refresh_project_row(idx)
             self._append_log(f"Настройки проекта {proj.get('folder')} обновлены")
 
     # ── Удаление проекта ──────────────────────────────────────────────────
@@ -1429,8 +1671,26 @@ class App(ctk.CTk):
 
         threading.Thread(target=_fetch, daemon=True).start()
 
+    def _existing_folders(self):
+        return {p.get("folder") for p in self._projects_config if p.get("folder")}
+
+    def _unique_folder(self, base):
+        """Если base занят — вернуть base-2, base-3 и т.д."""
+        existing = self._existing_folders()
+        if not base or base not in existing:
+            return base
+        n = 2
+        while f"{base}-{n}" in existing:
+            n += 1
+        return f"{base}-{n}"
+
     def _show_manual_add_dialog(self, provider_name):
-        """Диалог ручного ввода siteId (для провайдеров без /sites API)."""
+        """Диалог ручного ввода siteId (для провайдеров без /sites API).
+
+        Один и тот же site_id можно добавлять несколько раз — это позволяет
+        делать профили выгрузки (разные настройки для одного сайта). Уникальным
+        должен быть только folder, чтобы не было коллизий папок вывода.
+        """
         existing = {
             (p.get("provider", "callibri"), p.get("site_id"))
             for p in self._projects_config
@@ -1439,13 +1699,17 @@ class App(ctk.CTk):
         self.wait_window(dialog)
 
         if dialog.result is not None:
-            key = (dialog.result["provider"], dialog.result["site_id"])
-            if key in existing:
-                self._append_log(f"Проект [{key[0]}] site_id={key[1]} уже есть в конфиге")
-                return
+            new_folder = dialog.result.get("folder")
+            unique = self._unique_folder(new_folder)
+            if unique != new_folder:
+                self._append_log(
+                    f"Папка '{new_folder}' уже занята — создаю профиль как '{unique}'"
+                )
+                dialog.result["folder"] = unique
             self._projects_config.append(dialog.result)
             core.save_projects(self._projects_config)
             self._load_projects()
+            key = (dialog.result["provider"], dialog.result["site_id"])
             self._append_log(
                 f"Добавлен проект [{key[0]}]: {dialog.result['folder']} ({key[1]})"
             )
@@ -1459,15 +1723,18 @@ class App(ctk.CTk):
         self.wait_window(dialog)
 
         if dialog.result is not None:
-            new_sid = dialog.result["site_id"]
-            key = (dialog.result.get("provider", "callibri"), new_sid)
-            if key in existing:
-                self._append_log(f"Проект [{key[0]}] site_id={new_sid} уже есть в конфиге")
-                return
-
+            new_folder = dialog.result.get("folder")
+            unique = self._unique_folder(new_folder)
+            if unique != new_folder:
+                self._append_log(
+                    f"Папка '{new_folder}' уже занята — создаю профиль как '{unique}'"
+                )
+                dialog.result["folder"] = unique
             self._projects_config.append(dialog.result)
             core.save_projects(self._projects_config)
             self._load_projects()
+            new_sid = dialog.result["site_id"]
+            key = (dialog.result.get("provider", "callibri"), new_sid)
             self._append_log(f"Добавлен проект [{key[0]}]: {dialog.result['folder']} ({new_sid})")
 
     # ── Быстрый выбор периода ─────────────────────────────────────────────
@@ -1540,12 +1807,11 @@ class App(ctk.CTk):
             self._append_log(f"ОШИБКА: {e}")
             return
 
-        enabled_keys = set()
-        for pw in self._project_widgets:
-            if pw["var"].get():
-                enabled_keys.add((pw["provider"], pw["site_id"]))
-
-        if not enabled_keys:
+        # Чекбокс пишет proj["enabled"] прямо в файл (live-save), поэтому
+        # источник истины — projects.json. enabled_keys нам не нужен — это
+        # позволяет различать дубликаты (один site_id, разные folder/настройки).
+        any_enabled = any(pw["var"].get() for pw in self._project_widgets)
+        if not any_enabled:
             self._append_log("Нет выбранных проектов для экспорта")
             return
 
@@ -1566,7 +1832,6 @@ class App(ctk.CTk):
             credentials=credentials,
             date1_str=date1_str,
             date2_str=date2_str,
-            enabled_keys=enabled_keys,
             on_log=lambda m: self.msg_queue.put(("log", m)),
             on_progress=lambda pi, pt, ci, ct: self.msg_queue.put(("progress", pi, pt, ci, ct)),
             gsheet_credentials=gsheet_creds,
@@ -1595,6 +1860,11 @@ class App(ctk.CTk):
         for prov in providers.all_providers():
             creds[prov.NAME] = self._get_creds(prov)
         return creds
+
+    def _on_manage_calltouch_accounts(self):
+        dialog = CalltouchAccountsDialog(self)
+        self.wait_window(dialog)
+        # При следующем экспорте accounts.json перечитается автоматически.
 
     def _run_export(self, params):
         try:

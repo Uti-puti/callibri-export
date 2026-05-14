@@ -160,11 +160,26 @@ def export_to_sheet(client, spreadsheet_id, sheet_name, rows, columns,
     except _gspread.exceptions.WorksheetNotFound:
         raise ValueError(f'Лист "{sheet_name}" не найден в таблице "{spreadsheet.title}"')
 
-    # Готовим данные как список списков
+    # Готовим данные как список списков.
+    # Google Sheets — жёсткий лимит 50000 символов на ячейку. Обрезаем длинные
+    # значения с маркером, иначе API возвращает 400 и весь экспорт падает.
+    CELL_MAX = 50000
+    SAFE_MAX = 49900  # запас под маркер
+    TRUNC_MARK = "…[обрезано]"
+    truncated = 0
     header = list(columns)
     data_rows = []
     for row in rows:
-        data_rows.append([str(row.get(col, "") or "") for col in columns])
+        out_row = []
+        for col in columns:
+            value = str(row.get(col, "") or "")
+            if len(value) > CELL_MAX:
+                value = value[:SAFE_MAX] + TRUNC_MARK
+                truncated += 1
+            out_row.append(value)
+        data_rows.append(out_row)
+    if truncated:
+        _log(f"Внимание: обрезано {truncated} ячеек длиннее 50000 символов")
 
     if mode == "replace":
         _log(f'лист "{sheet_name}" — режим "заменить"')
@@ -225,15 +240,44 @@ def export_to_sheet(client, spreadsheet_id, sheet_name, rows, columns,
 BATCH_SIZE = 500
 
 
+def _ensure_grid_size(worksheet, needed_rows, needed_cols, on_log=None):
+    """Расширить grid листа, если данных больше, чем текущая сетка.
+
+    Google Sheets хранит фиксированный rowCount/colCount; запись за их пределы
+    даёт `Range exceeds grid limits`. Растим сетку с запасом, чтобы не делать
+    resize на каждый батч.
+    """
+    current_rows = worksheet.row_count
+    current_cols = worksheet.col_count
+
+    new_rows = max(current_rows, needed_rows)
+    new_cols = max(current_cols, needed_cols)
+
+    if new_rows == current_rows and new_cols == current_cols:
+        return
+
+    # Запас сверху, чтобы избежать частых resize'ов на серии append'ов.
+    new_rows = max(new_rows, current_rows + 1000) if needed_rows > current_rows else new_rows
+
+    worksheet.resize(rows=new_rows, cols=new_cols)
+    if on_log:
+        on_log(f"расширен лист до {new_rows} строк × {new_cols} колонок")
+
+
 def _batch_update(worksheet, values, start_row=1, on_log=None):
     """
     Записывает данные пакетами, чтобы не превысить квоту API.
     values — list[list[str]], start_row — номер строки (1-based).
+    Перед записью при необходимости расширяет grid листа.
     """
     if not values:
         return
 
     total = len(values)
+    needed_rows = start_row + total - 1
+    needed_cols = max((len(v) for v in values), default=1)
+    _ensure_grid_size(worksheet, needed_rows, needed_cols, on_log=on_log)
+
     for offset in range(0, total, BATCH_SIZE):
         batch = values[offset:offset + BATCH_SIZE]
         row_start = start_row + offset
